@@ -186,6 +186,20 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(categories, ["movies", "movies-4k", "tv", "tv-4k", "music"])
         self.assertIn("five media categories", detail)
 
+    def test_sabnzbd_uses_current_socks_setting(self):
+        self.reconciler.configure_sabnzbd(True)
+        forms = [call for call in self.client.calls if call[0] == "form"]
+        settings = {call[4].get("keyword"): call[4].get("value") for call in forms}
+        self.assertEqual(settings["socks5_proxy_url"], "socks5://vpn:1080")
+        self.assertNotIn("socks5_proxy", settings)
+
+    def test_profilarr_forms_are_same_origin(self):
+        self.client.json = lambda *_args, **_kwargs: []
+        self.assertEqual(self.reconciler.configure_profilarr()[0], "waiting")
+        call = next(call for call in self.client.calls if call[0] == "form")
+        self.assertEqual(call[3]["Origin"], "http://profilarr:6868")
+        self.assertEqual(call[3]["Referer"], "http://profilarr:6868/")
+
     def test_overseerr_profile_preferences_are_deterministic(self):
         profiles = [{"id": 1, "name": "Any"}, {"id": 2, "name": "1080p Quality HDR"}, {"id": 3, "name": "2160p Quality"}]
         self.assertEqual(self.reconciler._overseerr_profile(profiles, False)["id"], 2)

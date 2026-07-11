@@ -32,7 +32,7 @@ APP_PORTS = {
     "bazarr": 30989,
     "overseerr": 30990,
     "profilarr": 30991,
-    "setup": 30992,
+    "umbrelarr": 30992,
     "lidarr": 30993,
 }
 
@@ -50,7 +50,7 @@ NAMES = {
     "bazarr": "Bazarr",
     "overseerr": "Overseerr",
     "profilarr": "Profilarr",
-    "setup": "umbrelarr",
+    "umbrelarr": "umbrelarr",
     "lidarr": "Lidarr",
 }
 
@@ -127,7 +127,7 @@ class Reconciler:
         self.arrs = self._arr_instances()
         self.runtime.event("Reconciliation started")
         try:
-            storage_ok = self._step("setup", self.configure_storage)
+            storage_ok = self._step("umbrelarr", self.configure_storage)
             vpn_ok = self._step("privado-vpn", self.check_vpn)
             self._step("flaresolverr", self.check_flaresolverr)
             self._step("qbittorrent", self.configure_qbittorrent, vpn_ok)
@@ -255,7 +255,7 @@ class Reconciler:
         if not vpn_ok:
             return "waiting", "Waiting for a healthy Privado tunnel before applying proxy settings"
         for keyword, value in {
-            "socks5_proxy": f"socks5://{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_HOST', 'umbrel-arr-privado-vpn_server_1')}:{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_PORT', '1080')}",
+            "socks5_proxy_url": f"socks5://{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_HOST', 'umbrel-arr-privado-vpn_server_1')}:{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_PORT', '1080')}",
             "complete_dir": "/downloads/complete",
             "download_dir": "/downloads/incomplete",
             "username": "",
@@ -378,17 +378,18 @@ class Reconciler:
 
     def configure_profilarr(self):
         url = self.settings.url("profilarr")
+        form_headers = {"Origin": url, "Referer": f"{url}/"}
         self.client.json("GET", f"{url}/api/v1/status")
         databases = self.client.json("GET", f"{url}/api/v1/databases")
         database = next((item for item in databases if item.get("repository_url") == DATABASE_URL or item.get("name") == "Dictionarry"), None)
         if database is None:
-            self.client.form("POST", f"{url}/databases/new", {"name": "Dictionarry", "repository_url": DATABASE_URL, "branch": "v2", "sync_strategy": "1440", "auto_pull": "1"})
+            self.client.form("POST", f"{url}/databases/new", {"name": "Dictionarry", "repository_url": DATABASE_URL, "branch": "v2", "sync_strategy": "1440", "auto_pull": "1"}, form_headers)
             return "waiting", "Dictionarry database link queued; waiting for Profilarr to index it"
         instances = self.client.json("GET", f"{url}/api/v1/arr")
         current = {item.get("name"): item for item in instances}
         for arr in self.arrs[:4]:
             if arr.name not in current:
-                self.client.form("POST", f"{url}/arr/new", {"name": arr.name, "type": arr.implementation.lower(), "url": arr.url, "external_url": self.settings.external_url(arr.slug), "api_key": arr.api_key, "tags": json.dumps(["4k" if arr.is_4k else "hd", MANAGED_TAG])})
+                self.client.form("POST", f"{url}/arr/new", {"name": arr.name, "type": arr.implementation.lower(), "url": arr.url, "external_url": self.settings.external_url(arr.slug), "api_key": arr.api_key, "tags": json.dumps(["4k" if arr.is_4k else "hd", MANAGED_TAG])}, form_headers)
         instances = self.client.json("GET", f"{url}/api/v1/arr")
         current = {item.get("name"): item for item in instances}
         missing = [arr.name for arr in self.arrs[:4] if arr.name not in current]
@@ -398,11 +399,11 @@ class Reconciler:
             profiles = UHD_PROFILES if arr.is_4k else HD_PROFILES
             selections = [{"databaseId": database["id"], "profileName": name} for name in profiles]
             instance_id = current[arr.name]["id"]
-            self.client.form("POST", f"{url}/arr/{instance_id}/sync?/saveQualityProfiles", {"selections": json.dumps(selections), "priorities": json.dumps([{"databaseId": database["id"], "priority": 1}]), "trigger": "schedule", "cron": "0 3 * * *"}, {"x-sveltekit-action": "true"})
+            self.client.form("POST", f"{url}/arr/{instance_id}/sync?/saveQualityProfiles", {"selections": json.dumps(selections), "priorities": json.dumps([{"databaseId": database["id"], "priority": 1}]), "trigger": "schedule", "cron": "0 3 * * *"}, {**form_headers, "x-sveltekit-action": "true"})
             marker = f"profilarr.initial-sync.{instance_id}"
             if not self.ownership.get(marker):
                 try:
-                    self.client.form("POST", f"{url}/arr/{instance_id}/sync?/syncQualityProfiles", {}, {"x-sveltekit-action": "true"})
+                    self.client.form("POST", f"{url}/arr/{instance_id}/sync?/syncQualityProfiles", {}, {**form_headers, "x-sveltekit-action": "true"})
                 except RequestError as error:
                     if error.status != 409:
                         raise
