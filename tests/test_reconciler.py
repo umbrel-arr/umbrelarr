@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "app"
+ROOT = SOURCE.parent
 sys.path.insert(0, str(SOURCE))
 
 from dashboard import PAGE
@@ -276,6 +277,13 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("Reconcile", PAGE)
         self.assertNotIn("linear-gradient", PAGE)
         self.assertNotIn("border-radius:999", PAGE)
+
+
+class ImageTests(unittest.TestCase):
+    def test_image_uses_the_shared_media_uid(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        self.assertIn("adduser -S -D -H -u 1000", dockerfile)
+        self.assertIn("USER umbrelarr", dockerfile)
 
 
 if __name__ == "__main__":
