@@ -6,7 +6,7 @@ on:
       image_tag:
         description: Container tag to publish
         required: true
-        default: "1.0.4"
+        default: "1.0.5"
 
 permissions:
   contents: read

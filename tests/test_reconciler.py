@@ -236,6 +236,27 @@ class ReconcilerTests(unittest.TestCase):
             }],
         )
 
+    def test_prelogin_reconciliation_waits_without_false_failures(self):
+        reconciler = Reconciler(Settings(environment(self.temp.name)), self.client)
+        reconciler.configure_storage = lambda: "Storage ready"
+        reconciler.check_vpn = lambda: ("action_required", "Enter Privado login")
+        reconciler.check_flaresolverr = lambda: self.fail("FlareSolverr should wait for VPN")
+        reconciler.configure_qbittorrent = lambda _vpn_ok: ("waiting", "Waiting for VPN")
+        reconciler.configure_sabnzbd = lambda _vpn_ok: ("waiting", "Waiting for VPN")
+        reconciler.configure_arr = lambda _arr: self.fail("Arr apps should wait for download clients")
+        reconciler.configure_prowlarr = lambda _vpn_ok: self.fail("Prowlarr should wait for VPN")
+        reconciler.configure_bazarr = lambda _vpn_ok: self.fail("Bazarr should wait for VPN")
+        reconciler.configure_profilarr = lambda: "Profilarr ready"
+        reconciler.configure_overseerr = lambda: ("action_required", "Complete Plex sign-in")
+
+        reconciler.reconcile()
+
+        snapshot = reconciler.runtime.snapshot()
+        services = {service["id"]: service for service in snapshot["services"]}
+        waiting = {"flaresolverr", "prowlarr", "qbittorrent", "sabnzbd", "bazarr", *(arr.slug for arr in reconciler.arrs)}
+        self.assertTrue(all(services[slug]["status"] == "waiting" for slug in waiting))
+        self.assertEqual(snapshot["counts"]["failed"], 0)
+
     def test_prowlarr_configuration_is_idempotent(self):
         client = StackClient()
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)

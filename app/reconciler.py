@@ -129,17 +129,30 @@ class Reconciler:
         try:
             storage_ok = self._step("umbrelarr", self.configure_storage)
             vpn_ok = self._step("privado-vpn", self.check_vpn)
-            self._step("flaresolverr", self.check_flaresolverr)
-            self._step("qbittorrent", self.configure_qbittorrent, vpn_ok)
-            self._step("sabnzbd", self.configure_sabnzbd, vpn_ok)
-            if storage_ok:
+            if vpn_ok:
+                flaresolverr_ok = self._step("flaresolverr", self.check_flaresolverr)
+            else:
+                flaresolverr_ok = False
+                self.runtime.set("flaresolverr", "waiting", "Waiting for a healthy Privado tunnel")
+            qbittorrent_ok = self._step("qbittorrent", self.configure_qbittorrent, vpn_ok)
+            sabnzbd_ok = self._step("sabnzbd", self.configure_sabnzbd, vpn_ok)
+            if storage_ok and qbittorrent_ok and sabnzbd_ok:
                 for arr in self.arrs:
                     self._step(arr.slug, self.configure_arr, arr)
-            else:
+            elif not storage_ok:
                 for arr in self.arrs:
                     self.runtime.set(arr.slug, "waiting", "Waiting for writable network media storage")
-            self._step("prowlarr", self.configure_prowlarr, vpn_ok)
-            self._step("bazarr", self.configure_bazarr, vpn_ok)
+            else:
+                for arr in self.arrs:
+                    self.runtime.set(arr.slug, "waiting", "Waiting for Privado-routed download clients")
+            if vpn_ok and flaresolverr_ok:
+                self._step("prowlarr", self.configure_prowlarr, True)
+            else:
+                self.runtime.set("prowlarr", "waiting", "Waiting for Privado and FlareSolverr")
+            if vpn_ok:
+                self._step("bazarr", self.configure_bazarr, True)
+            else:
+                self.runtime.set("bazarr", "waiting", "Waiting for a healthy Privado tunnel")
             self._step("profilarr", self.configure_profilarr)
             self._step("overseerr", self.configure_overseerr)
             self.runtime.event("Reconciliation completed")
