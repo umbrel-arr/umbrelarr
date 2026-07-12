@@ -87,6 +87,10 @@ class StackClient(FakeClient):
         path = url.split("/api/", 1)[-1]
         if path.endswith("system/status"):
             return {"version": "test"}
+        if path.endswith("metadataprofile"):
+            return [{"id": 3, "name": "Standard"}]
+        if path.endswith("qualityprofile"):
+            return [{"id": 4, "name": "Any"}]
         if path.endswith("rootfolder"):
             if method == "POST":
                 created = {**payload, "id": len(self.roots) + 1}
@@ -221,7 +225,16 @@ class ReconcilerTests(unittest.TestCase):
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)
         arr = next(item for item in reconciler.arrs if item.slug == "lidarr")
         reconciler.configure_arr(arr)
-        self.assertEqual(client.roots, [{"path": "/downloads/music", "name": "Music", "id": 1}])
+        self.assertEqual(
+            client.roots,
+            [{
+                "path": "/downloads/music",
+                "name": "Music",
+                "defaultMetadataProfileId": 3,
+                "defaultQualityProfileId": 4,
+                "id": 1,
+            }],
+        )
 
     def test_prowlarr_configuration_is_idempotent(self):
         client = StackClient()

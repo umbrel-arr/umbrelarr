@@ -289,7 +289,21 @@ class Reconciler:
         if not any(item.get("path", "").rstrip("/") == arr.root.rstrip("/") for item in existing):
             payload = {"path": arr.root}
             if arr.implementation == "Lidarr":
+                metadata_profiles = self.client.json("GET", f"{arr.api}/metadataprofile", arr.api_key)
+                quality_profiles = self.client.json("GET", f"{arr.api}/qualityprofile", arr.api_key)
+                if not metadata_profiles or not quality_profiles:
+                    raise RuntimeError("Lidarr has no metadata or quality profile for the music root")
+                metadata = next(
+                    (item for item in metadata_profiles if item.get("name") == "Standard"),
+                    metadata_profiles[0],
+                )
+                quality = next(
+                    (item for item in quality_profiles if item.get("name") == "Any"),
+                    quality_profiles[0],
+                )
                 payload["name"] = Path(arr.root).name.replace("-", " ").title() or "Music"
+                payload["defaultMetadataProfileId"] = metadata["id"]
+                payload["defaultQualityProfileId"] = quality["id"]
             self.client.json("POST", f"{arr.api}/rootfolder", arr.api_key, payload)
 
     def _ensure_download_client(self, arr, implementation, name, client_url, client_key=None):
