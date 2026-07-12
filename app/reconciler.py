@@ -287,7 +287,10 @@ class Reconciler:
     def _ensure_root(self, arr):
         existing = self.client.json("GET", f"{arr.api}/rootfolder", arr.api_key)
         if not any(item.get("path", "").rstrip("/") == arr.root.rstrip("/") for item in existing):
-            self.client.json("POST", f"{arr.api}/rootfolder", arr.api_key, {"path": arr.root})
+            payload = {"path": arr.root}
+            if arr.implementation == "Lidarr":
+                payload["name"] = Path(arr.root).name.replace("-", " ").title() or "Music"
+            self.client.json("POST", f"{arr.api}/rootfolder", arr.api_key, payload)
 
     def _ensure_download_client(self, arr, implementation, name, client_url, client_key=None):
         schemas = self.client.json("GET", f"{arr.api}/downloadclient/schema", arr.api_key)

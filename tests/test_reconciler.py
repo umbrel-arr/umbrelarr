@@ -216,6 +216,13 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(len(client.clients), 2)
         self.assertEqual({item["name"] for item in client.clients}, {"Umbrel Arr qBittorrent", "Umbrel Arr SABnzbd"})
 
+    def test_lidarr_root_includes_its_required_name(self):
+        client = StackClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        arr = next(item for item in reconciler.arrs if item.slug == "lidarr")
+        reconciler.configure_arr(arr)
+        self.assertEqual(client.roots, [{"path": "/downloads/music", "name": "Music", "id": 1}])
+
     def test_prowlarr_configuration_is_idempotent(self):
         client = StackClient()
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)
