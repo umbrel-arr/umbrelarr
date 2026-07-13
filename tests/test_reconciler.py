@@ -91,12 +91,13 @@ class FakeClient:
 class QbitAuthClient(FakeClient):
     def __init__(
         self, active_password="temporary-password", allow_unauthenticated=False,
-        rejected_login_status=None,
+        rejected_login_status=None, session_cookie_name="SID",
     ):
         super().__init__()
         self.active_password = active_password
         self.allow_unauthenticated = allow_unauthenticated
         self.rejected_login_status = rejected_login_status
+        self.session_cookie_name = session_cookie_name
         self.preferences = {"web_ui_domain_list": "existing.example"}
 
     def request(self, method, url, headers=None, body=None, timeout=20):
@@ -114,7 +115,11 @@ class QbitAuthClient(FakeClient):
                 if self.rejected_login_status:
                     raise RequestError("Unauthorized", self.rejected_login_status)
                 return Response(200, {}, b"Fails.")
-            return Response(200, {"Set-Cookie": "SID=test-session; HttpOnly; path=/"}, b"Ok.")
+            return Response(
+                200,
+                {"Set-Cookie": f"{self.session_cookie_name}=test-session; HttpOnly; path=/"},
+                b"Ok.",
+            )
         if url.endswith("/api/v2/app/setPreferences"):
             changed = json.loads(values["json"])
             self.preferences.update(changed)
@@ -336,6 +341,17 @@ class ReconcilerTests(unittest.TestCase):
         ]
         self.assertEqual(passwords[:2], ["umbrel-password", "correct-temporary"])
         self.assertEqual(client.active_password, "umbrel-password")
+
+    def test_current_qbittorrent_versioned_session_cookie_is_accepted(self):
+        client = QbitAuthClient(session_cookie_name="QBT_SID_8080")
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler._onboard_qbittorrent("admin", "temporary-password")
+        self.assertEqual(reconciler._qbittorrent_cookie, "QBT_SID_8080=test-session")
+        preference_call = next(
+            call for call in client.calls
+            if call[0] == "form" and call[2].endswith("setPreferences")
+        )
+        self.assertEqual(preference_call[3]["Cookie"], "QBT_SID_8080=test-session")
 
     def test_legacy_unauthenticated_qbittorrent_is_secured_then_reauthenticated(self):
         client = QbitAuthClient(allow_unauthenticated=True)
