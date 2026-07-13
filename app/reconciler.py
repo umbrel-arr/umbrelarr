@@ -697,6 +697,33 @@ class Reconciler:
         self._sab_call(url, key, {"mode": "version"})
         if not vpn_ok:
             return "waiting", "Waiting for a healthy Privado tunnel before applying proxy settings"
+        whitelist_response = self._sab_call(
+            url, key,
+            {"mode": "get_config", "section": "misc", "keyword": "host_whitelist"},
+        )
+        whitelist_data = whitelist_response.json() if whitelist_response.body else {}
+        whitelist = (
+            whitelist_data.get("config", {}).get("misc", {}).get("host_whitelist", "")
+            if isinstance(whitelist_data, dict) else ""
+        )
+        entries = (
+            [str(value).strip() for value in whitelist]
+            if isinstance(whitelist, list)
+            else [value.strip() for value in str(whitelist).split(",")]
+        )
+        entries = [value for value in entries if value]
+        internal_host = urlsplit(url).hostname
+        if internal_host and internal_host not in entries:
+            entries.append(internal_host)
+            self._sab_call(
+                url, key,
+                {
+                    "mode": "set_config",
+                    "section": "misc",
+                    "keyword": "host_whitelist",
+                    "value": ",".join(entries),
+                },
+            )
         for keyword, value in {
             "socks5_proxy_url": f"socks5://{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_HOST', 'umbrel-arr-privado-vpn_server_1')}:{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_PORT', '1080')}",
             "complete_dir": "/downloads/complete",
