@@ -513,6 +513,7 @@ class ReconcilerTests(unittest.TestCase):
         settings = {call[4].get("keyword"): call[4].get("value") for call in forms}
         self.assertEqual(settings["socks5_proxy_url"], "socks5://vpn:1080")
         self.assertNotIn("socks5_proxy", settings)
+        self.assertTrue(all(call[3] == {"Host": "localhost:8080"} for call in forms))
 
     def test_profilarr_forms_are_same_origin(self):
         self.client.json = lambda *_args, **_kwargs: []

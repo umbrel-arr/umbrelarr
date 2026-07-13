@@ -711,7 +711,11 @@ class Reconciler:
 
     def _sab_call(self, url, key, values):
         query = {**values, "apikey": key, "output": "json"}
-        response = self.client.form("POST", f"{url}/api", query)
+        parsed = urlsplit(url)
+        trusted_host = "localhost" if parsed.port is None else f"localhost:{parsed.port}"
+        response = self.client.form(
+            "POST", f"{url}/api", query, {"Host": trusted_host},
+        )
         if response.body:
             data = response.json()
             if isinstance(data, dict) and data.get("status") is False:
