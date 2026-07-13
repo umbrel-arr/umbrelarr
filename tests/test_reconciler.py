@@ -198,7 +198,7 @@ class StackClient(FakeClient):
             return [dict(item) for item in self.roots]
         if path.endswith("downloadclient/schema"):
             return [
-                schema("QBittorrent", {"host": "", "port": 0, "useSsl": False, "urlBase": "", "category": ""}),
+                schema("QBittorrent", {"host": "", "port": 0, "useSsl": False, "urlBase": "", "category": "", "username": "", "password": ""}),
                 schema("Sabnzbd", {"host": "", "port": 0, "useSsl": False, "urlBase": "", "category": "", "apiKey": ""}),
             ]
         if path.endswith("downloadclient"):
@@ -554,6 +554,10 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(client.roots, [{"path": "/downloads/movies", "id": 1}])
         self.assertEqual(len(client.clients), 2)
         self.assertEqual({item["name"] for item in client.clients}, {"Umbrel Arr qBittorrent", "Umbrel Arr SABnzbd"})
+        qbittorrent = next(item for item in client.clients if item["name"] == "Umbrel Arr qBittorrent")
+        fields = {field["name"]: field["value"] for field in qbittorrent["fields"]}
+        self.assertEqual(fields["username"], "admin")
+        self.assertEqual(fields["password"], "umbrel-password")
 
     def test_lidarr_root_includes_its_required_name(self):
         client = StackClient()
