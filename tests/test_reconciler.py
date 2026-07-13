@@ -508,10 +508,23 @@ class ReconcilerTests(unittest.TestCase):
         self.assertIn("five media categories", detail)
 
     def test_sabnzbd_uses_current_socks_setting(self):
+        original_form = self.client.form
+
+        def form(method, url, values, headers=None):
+            if values.get("mode") == "get_config":
+                self.client.calls.append(("form", method, url, headers, values))
+                return Response(
+                    200, {},
+                    b'{"config":{"misc":{"host_whitelist":"existing.example"}}}',
+                )
+            return original_form(method, url, values, headers)
+
+        self.client.form = form
         self.reconciler.configure_sabnzbd(True)
         forms = [call for call in self.client.calls if call[0] == "form"]
         settings = {call[4].get("keyword"): call[4].get("value") for call in forms}
         self.assertEqual(settings["socks5_proxy_url"], "socks5://vpn:1080")
+        self.assertEqual(settings["host_whitelist"], "existing.example,sab")
         self.assertNotIn("socks5_proxy", settings)
         self.assertTrue(all(call[3] == {"Host": "localhost:8080"} for call in forms))
 
