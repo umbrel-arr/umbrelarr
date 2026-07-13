@@ -767,6 +767,11 @@ class Reconciler:
         }
         if client_key:
             values["apiKey"] = client_key
+        if implementation == "QBittorrent":
+            values.update({
+                "username": "admin",
+                "password": self.settings.qbittorrent_password,
+            })
         self._set_fields(payload, values)
         payload.update({"name": name, "enable": True, "priority": 1, "removeCompletedDownloads": True, "removeFailedDownloads": True, "tags": []})
         self._upsert(arr.api, "downloadclient", arr.api_key, payload, existing)
