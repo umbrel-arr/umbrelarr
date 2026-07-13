@@ -569,12 +569,17 @@ class Reconciler:
 
     def _qbit_login(self, username, password):
         origin = self.settings.url("qbittorrent")
-        response = self.client.form(
-            "POST",
-            f"{origin}/api/v2/auth/login",
-            {"username": username, "password": password},
-            {"Origin": origin, "Referer": f"{origin}/"},
-        )
+        try:
+            response = self.client.form(
+                "POST",
+                f"{origin}/api/v2/auth/login",
+                {"username": username, "password": password},
+                {"Origin": origin, "Referer": f"{origin}/"},
+            )
+        except RequestError as error:
+            if error.status in {401, 403}:
+                return False
+            raise
         body = response.body.decode("utf-8", "replace").strip()
         if body and body.casefold().startswith("fails"):
             return False
