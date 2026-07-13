@@ -4,16 +4,22 @@ import os
 import re
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from api_keys import ApiKeyResolver
 from http_client import HttpClient, RequestError
-from state import OwnershipState, RuntimeState, ServiceStatus
-from storage import StorageSettings
+from state import RuntimeState, ServiceStatus
+from storage import LOCAL_ROOTS, PRESETS, StorageSettings
 
 
 MANAGED_TAG = "umbrel-arr-managed"
+SETUP_MARKER_TAG = "umbrel-arr-setup-complete"
+SETUP_READY_MARKER_TAG = "umbrel-arr-setup-ready-v1"
+PROFILARR_SYNC_MARKER_TAG = "umbrel-arr-profilarr-initial-sync-v1"
+STORAGE_MARKER_PREFIX = "umbrel-arr-storage-"
 DATABASE_URL = "https://github.com/Dictionarry-Hub/database"
 HD_PROFILES = ["1080p Compact", "1080p Efficient", "1080p Quality HDR"]
 UHD_PROFILES = ["2160p Efficient", "2160p Quality"]
@@ -55,6 +61,30 @@ NAMES = {
 }
 
 
+MEDIA_APPS = ("sonarr", "sonarr-4k", "radarr", "radarr-4k", "lidarr")
+HD_UHD_VIDEO_APPS = ("sonarr", "sonarr-4k", "radarr", "radarr-4k")
+REQUIRED_APPS = tuple(slug for slug in NAMES if slug != "umbrelarr")
+KEYED_APPS = {
+    "prowlarr", "sabnzbd", "sonarr", "sonarr-4k", "radarr", "radarr-4k",
+    "bazarr", "overseerr", "lidarr",
+}
+DEPENDENCIES = {
+    "umbrelarr": (),
+    "privado-vpn": (),
+    "flaresolverr": ("privado-vpn",),
+    "qbittorrent": ("privado-vpn",),
+    "sabnzbd": ("privado-vpn",),
+    **{
+        slug: ("umbrelarr", "qbittorrent", "sabnzbd")
+        for slug in MEDIA_APPS
+    },
+    "prowlarr": ("privado-vpn", "flaresolverr", *MEDIA_APPS),
+    "bazarr": ("privado-vpn", "sonarr", "radarr"),
+    "profilarr": HD_UHD_VIDEO_APPS,
+    "overseerr": HD_UHD_VIDEO_APPS,
+}
+
+
 @dataclass
 class ArrInstance:
     slug: str
@@ -78,8 +108,8 @@ class Settings:
         env = environ or os.environ
         self.env = env
         self.device_domain = env.get("DEVICE_DOMAIN_NAME", "umbrel.local")
-        self.state_dir = Path(env.get("STATE_DIR", "/data"))
         self.interval = max(30, int(env.get("RECONCILE_INTERVAL", "300")))
+        self.api_keys = ApiKeyResolver(env.get("UMBREL_ARR_MANAGED_CONFIG_DIR", "/managed-config"))
 
     def url(self, slug):
         key = f"UMBREL_ARR_{slug.upper().replace('-', '_')}_URL"
@@ -87,10 +117,15 @@ class Settings:
 
     def key(self, slug):
         key = f"UMBREL_ARR_{slug.upper().replace('-', '_')}_API_KEY"
-        return self.env.get(key, "").strip()
+        exported = self.env.get(key, "").strip()
+        return exported or self.api_keys.resolve(slug)
 
     def external_url(self, slug):
         return f"http://{self.device_domain}:{APP_PORTS[slug]}"
+
+    @property
+    def qbittorrent_password(self):
+        return self.env.get("UMBREL_ARR_QBITTORRENT_PASSWORD", "")
 
 
 class Reconciler:
@@ -101,10 +136,15 @@ class Reconciler:
             ServiceStatus(slug, NAMES[slug], link=self.settings.external_url(slug))
             for slug in NAMES
         ]
-        self.runtime = RuntimeState(services)
-        self.ownership = OwnershipState(self.settings.state_dir / "ownership.json")
-        self.storage = StorageSettings(self.settings.state_dir / "storage.json")
+        self.runtime = RuntimeState(services, DEPENDENCIES)
+        self.storage = StorageSettings()
         self.arrs = self._arr_instances()
+        self._setup_lock = threading.RLock()
+        self._setup_complete = False
+        self._setup_ready = False
+        self._setup_detection = []
+        self._qbittorrent_cookie = ""
+        self._mark_setup_required()
 
     def _arr_instances(self):
         return [
@@ -116,12 +156,17 @@ class Reconciler:
         ]
 
     def reconcile_async(self):
+        if not self.ensure_setup_ready():
+            raise RuntimeError("Complete app discovery and connection setup before reconciling")
         if self.runtime.running:
             return False
         threading.Thread(target=self.reconcile, name="reconcile", daemon=True).start()
         return True
 
     def reconcile(self):
+        if not self.ensure_setup_ready():
+            self._mark_setup_required()
+            return
         if not self.runtime.begin():
             return
         self.arrs = self._arr_instances()
@@ -159,6 +204,171 @@ class Reconciler:
         finally:
             self.runtime.complete()
 
+    def _mark_setup_required(self):
+        self.runtime.set("umbrelarr", "action_required", "Detect and connect the Umbrel Arr apps you installed")
+        for slug in REQUIRED_APPS:
+            self.runtime.set(slug, "unknown", "Waiting for explicit Umbrelarr setup")
+
+    def ensure_setup(self):
+        with self._setup_lock:
+            if self._setup_complete:
+                return True
+        key = self.settings.key("prowlarr")
+        url = self.settings.url("prowlarr")
+        if not key or not url:
+            return False
+        try:
+            tags = self.client.json("GET", f"{url}/api/v1/tag", key)
+        except (RequestError, OSError, ValueError):
+            return False
+        complete = any(
+            item.get("label", "").casefold() == SETUP_MARKER_TAG
+            for item in tags or []
+        )
+        with self._setup_lock:
+            self._setup_complete = complete
+        return complete
+
+    def setup_snapshot(self):
+        confirmed = self.ensure_setup()
+        ready = self.ensure_setup_ready()
+        with self._setup_lock:
+            apps = [dict(item) for item in self._setup_detection]
+        reachable = sum(item["reachable"] for item in apps)
+        detection_complete = len(apps) == len(REQUIRED_APPS)
+        blocking = [
+            item for item in apps
+            if not item["reachable"] or (not item["credentials"] and item["id"] != "qbittorrent")
+        ]
+        can_confirm = detection_complete and not blocking
+        if ready:
+            phase = "confirmed"
+        elif confirmed:
+            phase = "action_required"
+        elif not detection_complete:
+            phase = "detect"
+        elif can_confirm:
+            phase = "ready"
+        else:
+            phase = "action_required"
+        return {
+            "phase": phase,
+            "confirmed": confirmed,
+            "canConfirm": can_confirm,
+            "requiredCount": len(REQUIRED_APPS),
+            "detectedCount": reachable,
+            "detectionComplete": detection_complete,
+            "apps": apps,
+        }
+
+    def ensure_setup_ready(self):
+        if not self.ensure_setup():
+            return False
+        with self._setup_lock:
+            if self._setup_ready:
+                return True
+        ready = any(
+            item.get("label", "").casefold() == SETUP_READY_MARKER_TAG
+            for item in self._prowlarr_tags(required=False)
+        )
+        with self._setup_lock:
+            self._setup_ready = ready
+        return ready
+
+    def detect_apps(self):
+        with ThreadPoolExecutor(max_workers=min(8, len(REQUIRED_APPS))) as executor:
+            apps = list(executor.map(self._detect_app, REQUIRED_APPS))
+        with self._setup_lock:
+            self._setup_detection = apps
+        self.runtime.event(f"Detected {sum(item['reachable'] for item in apps)} of {len(apps)} installed Umbrel Arr apps")
+        return self.setup_snapshot()
+
+    def _detect_app(self, slug):
+        url = self.settings.url(slug)
+        reachable = False
+        probe_succeeded = False
+        detail = "No configured service address"
+        if url:
+            try:
+                probe = f"{url}/api/v2/app/version" if slug == "qbittorrent" else f"{url}/"
+                self.client.request("GET", probe, timeout=3)
+                reachable = True
+                probe_succeeded = True
+                detail = "Installed app is reachable"
+            except RequestError as error:
+                if error.status is not None:
+                    reachable = True
+                    detail = "Installed app is reachable"
+                else:
+                    detail = "App was not reachable"
+        if slug == "qbittorrent":
+            credentials = probe_succeeded
+            # A successful version probe means legacy unauthenticated access.
+            # Authentication errors are reachable but require the temporary
+            # password to be supplied only to the confirmation request.
+            if reachable and not credentials:
+                detail = "Enter qBittorrent's one-time password when confirming setup"
+        else:
+            credentials = slug not in KEYED_APPS or bool(self.settings.key(slug))
+        if reachable and not credentials and slug != "qbittorrent":
+            detail = "Installed app found; waiting for its API key"
+        action = "none"
+        if not reachable:
+            action = "install_or_start"
+        elif not credentials:
+            action = "temporary_password_required" if slug == "qbittorrent" else "wait_for_api_key"
+        return {
+            "id": slug,
+            "name": NAMES[slug],
+            "reachable": reachable,
+            "credentials": credentials,
+            "action": action,
+            "detected": reachable,
+            "detail": detail,
+            "link": self.settings.external_url(slug),
+        }
+
+    def confirm_setup(
+        self, storage_mode="", root_ids=None,
+        qbittorrent_username="admin", qbittorrent_temporary_password="",
+    ):
+        snapshot = self.setup_snapshot()
+        if not snapshot["detectionComplete"]:
+            raise ValueError("Detect installed apps before connecting them")
+        missing = [item["name"] for item in snapshot["apps"] if not item["reachable"]]
+        if missing:
+            raise ValueError(f"Install or start these required apps first: {', '.join(missing)}")
+        missing_keys = [
+            item["name"] for item in snapshot["apps"]
+            if item["id"] != "qbittorrent" and not item["credentials"]
+        ]
+        if missing_keys:
+            raise ValueError(f"Wait for these apps to generate API credentials: {', '.join(missing_keys)}")
+        if not storage_mode:
+            raise ValueError("Choose local, network, or existing library roots before confirming setup")
+        self._validate_storage_selection(storage_mode, root_ids or {})
+        key = self.settings.key("prowlarr")
+        api = f"{self.settings.url('prowlarr')}/api/v1"
+        tags = self.client.json("GET", f"{api}/tag", key)
+        marker = next(
+            (item for item in tags if item.get("label", "").casefold() == SETUP_MARKER_TAG),
+            None,
+        )
+        if marker is None:
+            self.client.json("POST", f"{api}/tag", key, {"label": SETUP_MARKER_TAG})
+        with self._setup_lock:
+            self._setup_complete = True
+        self._onboard_qbittorrent(qbittorrent_username, qbittorrent_temporary_password)
+        self._apply_storage(storage_mode, root_ids or {})
+        tags = self.client.json("GET", f"{api}/tag", key)
+        if not any(item.get("label", "").casefold() == SETUP_READY_MARKER_TAG for item in tags):
+            self.client.json("POST", f"{api}/tag", key, {"label": SETUP_READY_MARKER_TAG})
+        with self._setup_lock:
+            self._setup_ready = True
+        self.runtime.event("Explicit setup completed; installed apps are now managed")
+        self.reconcile_async()
+        return self.setup_snapshot()
+
     def _step(self, slug, callback, *args):
         self.runtime.set(slug, "configuring", "Checking managed configuration")
         try:
@@ -182,28 +392,221 @@ class Reconciler:
     @staticmethod
     def _safe_error(error):
         value = str(error)
-        value = re.sub(r"(?i)(api[_-]?key|password|token)[=:][^&\s\"']+", r"\1=[redacted]", value)
+        value = re.sub(
+            r"(?i)(api[_-]?key|password|token)(?:[\"']?\s*[:=]\s*[\"']?)([^&\s,}\"']+)",
+            r"\1=[redacted]", value,
+        )
         return value[:300]
 
     def configure_storage(self):
-        roots = [
-            Path("/downloads/incomplete"),
-            Path("/downloads/complete"),
-            *(Path(arr.root) for arr in self.arrs),
-        ]
-        for root in roots:
-            root.mkdir(parents=True, exist_ok=True)
-        probe = Path(self.arrs[0].root).parent / ".umbrelarr-write-test"
-        probe.write_text("ok")
-        probe.unlink()
-        return "Download and library roots are writable"
+        snapshot = self.storage_snapshot()
+        if snapshot["actionRequired"]:
+            return "action_required", "Choose one existing root folder for each library"
+        return "Library roots were derived from the managed Arr APIs"
 
-    def save_storage(self, mode, roots):
-        snapshot = self.storage.update(mode, roots)
-        self.arrs = self._arr_instances()
-        self.runtime.event(f"Library roots changed to {mode} storage")
+    def storage_snapshot(self):
+        folders = self._read_root_folders(required=False)
+        mode, root_ids = self._storage_marker_selection(self._prowlarr_tags(required=False))
+        return self.storage.update_from_apis(folders, mode, root_ids)
+
+    def save_storage(self, mode, root_ids):
+        if not self.ensure_setup_ready():
+            raise RuntimeError("Complete explicit setup before changing library roots")
+        snapshot = self._apply_storage(mode, root_ids)
+        self.runtime.event(f"Library layout applied through service APIs for {mode} storage")
         self.reconcile_async()
         return snapshot
+
+    def _apply_storage(self, mode, root_ids):
+        if mode == "adopt":
+            mode = "adopted"
+        if mode not in {*PRESETS, "adopted"}:
+            raise ValueError("Storage mode must be local, network, or adopt")
+        folders = self._read_root_folders(required=True)
+        if mode in PRESETS:
+            self.storage.update_from_apis(folders, mode)
+            self.arrs = self._arr_instances()
+            for arr in self.arrs:
+                self._ensure_root(arr)
+            folders = self._read_root_folders(required=True)
+            snapshot = self.storage.update_from_apis(folders, mode)
+            if set(snapshot["rootIds"]) != set(LOCAL_ROOTS):
+                raise RuntimeError("The selected preset roots were not accepted by every Arr app")
+            marker_labels = [f"{STORAGE_MARKER_PREFIX}{mode}"]
+        else:
+            cleaned_ids = {
+                slug: int(value) for slug, value in root_ids.items()
+                if slug in LOCAL_ROOTS and str(value).strip()
+            }
+            snapshot = self.storage.update_from_apis(folders, "adopted", cleaned_ids)
+            if snapshot["actionRequired"]:
+                raise ValueError("Choose one existing root-folder ID for every library")
+            marker_labels = [
+                f"{STORAGE_MARKER_PREFIX}{slug}-{snapshot['rootIds'][slug]}"
+                for slug in LOCAL_ROOTS
+            ]
+        self._replace_storage_markers(marker_labels)
+        self.arrs = self._arr_instances()
+        return snapshot
+
+    def _validate_storage_selection(self, mode, root_ids):
+        normalized = "adopted" if mode == "adopt" else mode
+        if normalized not in {*PRESETS, "adopted"}:
+            raise ValueError("Storage mode must be local, network, or adopt")
+        if normalized != "adopted":
+            return
+        folders = self._read_root_folders(required=True)
+        cleaned_ids = {
+            slug: int(value) for slug, value in root_ids.items()
+            if slug in LOCAL_ROOTS and str(value).strip()
+        }
+        candidate = StorageSettings().update_from_apis(folders, "adopted", cleaned_ids)
+        if candidate["actionRequired"]:
+            raise ValueError("Choose one existing root-folder ID for every library")
+
+    def _read_root_folders(self, required):
+        folders = {}
+        for arr in self._arr_instances():
+            if not arr.url or not arr.api_key:
+                if required:
+                    raise ValueError(f"{arr.name} API credentials are not available")
+                folders[arr.slug] = []
+                continue
+            try:
+                values = self.client.json("GET", f"{arr.api}/rootfolder", arr.api_key)
+            except (RequestError, OSError, ValueError):
+                if required:
+                    raise
+                values = []
+            folders[arr.slug] = values if isinstance(values, list) else []
+        return folders
+
+    def _prowlarr_tags(self, required=True):
+        key = self.settings.key("prowlarr")
+        url = self.settings.url("prowlarr")
+        if not key or not url:
+            if required:
+                raise ValueError("Prowlarr API credentials are not available")
+            return []
+        try:
+            values = self.client.json("GET", f"{url}/api/v1/tag", key)
+        except (RequestError, OSError, ValueError):
+            if required:
+                raise
+            return []
+        return values if isinstance(values, list) else []
+
+    @staticmethod
+    def _storage_marker_selection(tags):
+        labels = {
+            str(item.get("label", "")).casefold()
+            for item in tags
+        }
+        for mode in PRESETS:
+            if f"{STORAGE_MARKER_PREFIX}{mode}" in labels:
+                return mode, {}
+        root_ids = {}
+        for slug in LOCAL_ROOTS:
+            prefix = f"{STORAGE_MARKER_PREFIX}{slug}-"
+            label = next(
+                (value for value in labels if re.fullmatch(rf"{re.escape(prefix)}\d+", value)),
+                "",
+            )
+            try:
+                root_ids[slug] = int(label.removeprefix(prefix))
+            except ValueError:
+                pass
+        return ("adopted", root_ids) if root_ids else (None, {})
+
+    def _replace_storage_markers(self, labels):
+        key = self.settings.key("prowlarr")
+        api = f"{self.settings.url('prowlarr')}/api/v1"
+        tags = self._prowlarr_tags()
+        existing = {
+            str(item.get("label", "")).casefold(): item
+            for item in tags
+        }
+        desired = {label.casefold() for label in labels}
+        for label, item in existing.items():
+            if label.startswith(STORAGE_MARKER_PREFIX) and label not in desired:
+                self.client.json("DELETE", f"{api}/tag/{item['id']}", key)
+        for label in labels:
+            if label.casefold() not in existing:
+                self.client.json("POST", f"{api}/tag", key, {"label": label})
+
+    def _onboard_qbittorrent(self, username="admin", temporary_password=""):
+        base = f"{self.settings.url('qbittorrent')}/api/v2"
+        deterministic = self.settings.qbittorrent_password
+        try:
+            self.client.request("GET", f"{base}/app/version", timeout=5)
+            self._qbittorrent_cookie = ""
+        except RequestError as error:
+            if error.status not in {401, 403}:
+                raise
+            authenticated = False
+            if deterministic:
+                authenticated = self._qbit_login("admin", deterministic)
+            if not authenticated and temporary_password:
+                authenticated = self._qbit_login(username.strip() or "admin", temporary_password)
+            if not authenticated:
+                raise ValueError("Enter qBittorrent's one-time admin password to continue")
+        if not deterministic:
+            raise ValueError("The deterministic qBittorrent password export is missing")
+        current = self.client.json(
+            "GET", f"{base}/app/preferences", headers=self._qbit_headers(),
+        ) or {}
+        web_preferences = self._qbit_security_preferences(current)
+        web_preferences.update({"web_ui_username": "admin", "web_ui_password": deterministic})
+        self.client.form(
+            "POST",
+            f"{base}/app/setPreferences",
+            {"json": json.dumps(web_preferences)},
+            self._qbit_headers(),
+        )
+        if not self._qbittorrent_cookie:
+            if not self._qbit_login("admin", deterministic):
+                raise RuntimeError("qBittorrent did not accept its configured Umbrel password")
+
+    def _qbit_login(self, username, password):
+        origin = self.settings.url("qbittorrent")
+        response = self.client.form(
+            "POST",
+            f"{origin}/api/v2/auth/login",
+            {"username": username, "password": password},
+            {"Origin": origin, "Referer": f"{origin}/"},
+        )
+        body = response.body.decode("utf-8", "replace").strip()
+        if body and body.casefold().startswith("fails"):
+            return False
+        cookie = response.headers.get("Set-Cookie", "") if response.headers else ""
+        self._qbittorrent_cookie = cookie.split(";", 1)[0]
+        return self._qbittorrent_cookie.startswith("SID=")
+
+    def _qbit_headers(self):
+        origin = self.settings.url("qbittorrent")
+        headers = {"Origin": origin, "Referer": f"{origin}/"}
+        if self._qbittorrent_cookie:
+            headers["Cookie"] = self._qbittorrent_cookie
+        return headers
+
+    def _qbit_security_preferences(self, current):
+        domains = {
+            value.strip() for value in str(current.get("web_ui_domain_list", "")).split(";")
+            if value.strip() and value.strip() != "*"
+        }
+        internal_host = urlsplit(self.settings.url("qbittorrent")).hostname
+        domains.update(value for value in (internal_host, self.settings.device_domain, "localhost") if value)
+        return {
+            "web_ui_csrf_protection_enabled": True,
+            "web_ui_clickjacking_protection_enabled": True,
+            "web_ui_host_header_validation_enabled": True,
+            "web_ui_domain_list": ";".join(sorted(domains)),
+            "web_ui_secure_cookie_enabled": False,
+            "web_ui_upnp": False,
+            "bypass_local_auth": False,
+            "bypass_auth_subnet_whitelist_enabled": False,
+            "bypass_auth_subnet_whitelist": "",
+        }
 
     def check_vpn(self):
         status = self.client.json("GET", f"{self.settings.url('privado-vpn')}/api/status")
@@ -233,10 +636,22 @@ class Reconciler:
 
     def configure_qbittorrent(self, vpn_ok):
         base = f"{self.settings.url('qbittorrent')}/api/v2"
-        self.client.request("GET", f"{base}/app/version")
+        try:
+            self.client.request("GET", f"{base}/app/version", headers=self._qbit_headers())
+        except RequestError as error:
+            if error.status not in {401, 403} or not self.settings.qbittorrent_password:
+                if error.status in {401, 403}:
+                    return "action_required", "Complete qBittorrent authentication in explicit setup"
+                raise
+            if not self._qbit_login("admin", self.settings.qbittorrent_password):
+                return "action_required", "qBittorrent rejected its configured Umbrel password"
         if not vpn_ok:
             return "waiting", "Waiting for a healthy Privado tunnel before applying proxy settings"
+        current = self.client.json(
+            "GET", f"{base}/app/preferences", headers=self._qbit_headers(),
+        ) or {}
         preferences = {
+            **self._qbit_security_preferences(current),
             "proxy_type": "SOCKS5",
             "proxy_ip": self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_HOST", "umbrel-arr-privado-vpn_server_1"),
             "proxy_port": int(self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_PORT", "1080")),
@@ -250,10 +665,17 @@ class Reconciler:
             "temp_path": "/downloads/incomplete/",
             "temp_path_enabled": True,
         }
-        self.client.form("POST", f"{base}/app/setPreferences", {"json": json.dumps(preferences)})
+        self.client.form(
+            "POST", f"{base}/app/setPreferences",
+            {"json": json.dumps(preferences)}, self._qbit_headers(),
+        )
         for category in ("movies", "movies-4k", "tv", "tv-4k", "music"):
             try:
-                self.client.form("POST", f"{base}/torrents/createCategory", {"category": category, "savePath": f"/downloads/complete/{category}"})
+                self.client.form(
+                    "POST", f"{base}/torrents/createCategory",
+                    {"category": category, "savePath": f"/downloads/complete/{category}"},
+                    self._qbit_headers(),
+                )
             except RequestError as error:
                 if error.status != 409:
                     raise
@@ -263,7 +685,7 @@ class Reconciler:
         url = self.settings.url("sabnzbd")
         key = self.settings.key("sabnzbd")
         if not key:
-            raise RuntimeError("SABnzbd API key export is missing")
+            return "waiting", "Waiting for SABnzbd to persist its API key"
         self._sab_call(url, key, {"mode": "version"})
         if not vpn_ok:
             return "waiting", "Waiting for a healthy Privado tunnel before applying proxy settings"
@@ -290,7 +712,7 @@ class Reconciler:
 
     def configure_arr(self, arr):
         if not arr.api_key:
-            raise RuntimeError(f"{arr.name} API key export is missing")
+            return "waiting", f"Waiting for {arr.name} to persist its API key"
         self.client.json("GET", f"{arr.api}/system/status", arr.api_key)
         self._ensure_root(arr)
         self._ensure_download_client(arr, "QBittorrent", "Umbrel Arr qBittorrent", self.settings.url("qbittorrent"))
@@ -341,7 +763,7 @@ class Reconciler:
         url = self.settings.url("prowlarr")
         key = self.settings.key("prowlarr")
         if not key:
-            raise RuntimeError("Prowlarr API key export is missing")
+            return "waiting", "Waiting for Prowlarr to persist its API key"
         api = f"{url}/api/v1"
         self.client.json("GET", f"{api}/system/status", key)
         if vpn_ok:
@@ -381,7 +803,7 @@ class Reconciler:
     def configure_bazarr(self, vpn_ok):
         key = self.settings.key("bazarr")
         if not key:
-            raise RuntimeError("Bazarr API key export is missing")
+            return "waiting", "Waiting for Bazarr to persist its API key"
         values = {
             "settings-general-use_sonarr": "true",
             "settings-sonarr-ip": urlsplit(self.settings.url("sonarr")).hostname,
@@ -425,19 +847,27 @@ class Reconciler:
         missing = [arr.name for arr in self.arrs[:4] if arr.name not in current]
         if missing:
             return "waiting", f"Waiting for Profilarr Arr connections: {', '.join(missing)}"
+        sync_marker_present = any(
+            str(item.get("label", "")).casefold() == PROFILARR_SYNC_MARKER_TAG
+            for item in self._prowlarr_tags()
+        )
         for arr in self.arrs[:4]:
             profiles = UHD_PROFILES if arr.is_4k else HD_PROFILES
             selections = [{"databaseId": database["id"], "profileName": name} for name in profiles]
             instance_id = current[arr.name]["id"]
             self.client.form("POST", f"{url}/arr/{instance_id}/sync?/saveQualityProfiles", {"selections": json.dumps(selections), "priorities": json.dumps([{"databaseId": database["id"], "priority": 1}]), "trigger": "schedule", "cron": "0 3 * * *"}, {**form_headers, "x-sveltekit-action": "true"})
-            marker = f"profilarr.initial-sync.{instance_id}"
-            if not self.ownership.get(marker):
+            if not sync_marker_present:
                 try:
                     self.client.form("POST", f"{url}/arr/{instance_id}/sync?/syncQualityProfiles", {}, {**form_headers, "x-sveltekit-action": "true"})
                 except RequestError as error:
                     if error.status != 409:
                         raise
-                self.ownership.set(marker, True)
+        if not sync_marker_present:
+            prowlarr_key = self.settings.key("prowlarr")
+            self.client.json(
+                "POST", f"{self.settings.url('prowlarr')}/api/v1/tag",
+                prowlarr_key, {"label": PROFILARR_SYNC_MARKER_TAG},
+            )
         return "Dictionarry profiles and referenced custom formats sync daily to four Arr instances"
 
     def configure_overseerr(self):
@@ -446,6 +876,8 @@ class Reconciler:
         public = self.client.json("GET", f"{url}/api/v1/settings/public")
         if not public.get("initialized"):
             return "action_required", "Complete the Plex sign-in in Overseerr; server registration will continue automatically"
+        if not key:
+            return "waiting", "Waiting for Overseerr to persist its API key"
         headers = {"X-API-Key": key}
         for kind, arrs in (("sonarr", self.arrs[:2]), ("radarr", self.arrs[2:4])):
             existing = self.client.json("GET", f"{url}/api/v1/settings/{kind}", headers=headers)
@@ -514,5 +946,8 @@ class ReconcileLoop:
 
     def run(self):
         while not self.stop_event.is_set():
-            self.reconciler.reconcile()
+            if self.reconciler.ensure_setup_ready():
+                self.reconciler.reconcile()
+            else:
+                self.reconciler._mark_setup_required()
             self.stop_event.wait(self.reconciler.settings.interval)
