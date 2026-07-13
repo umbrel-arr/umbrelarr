@@ -1,6 +1,4 @@
-import json
 import threading
-from pathlib import Path, PurePosixPath
 
 
 LOCAL_ROOTS = {
@@ -21,56 +19,129 @@ NETWORK_ROOTS = {
 
 PRESETS = {"local": LOCAL_ROOTS, "network": NETWORK_ROOTS}
 
+LIBRARY_DEFINITIONS = {
+    "sonarr": {
+        "id": "tv",
+        "name": "TV",
+        "variant": "HD",
+        "category": "tv",
+        "apps": ["sonarr", "qbittorrent", "sabnzbd", "prowlarr", "bazarr", "profilarr", "overseerr"],
+    },
+    "sonarr-4k": {
+        "id": "tv-4k",
+        "name": "TV",
+        "variant": "4K",
+        "category": "tv-4k",
+        "apps": ["sonarr-4k", "qbittorrent", "sabnzbd", "prowlarr", "profilarr", "overseerr"],
+    },
+    "radarr": {
+        "id": "movies",
+        "name": "Movies",
+        "variant": "HD",
+        "category": "movies",
+        "apps": ["radarr", "qbittorrent", "sabnzbd", "prowlarr", "bazarr", "profilarr", "overseerr"],
+    },
+    "radarr-4k": {
+        "id": "movies-4k",
+        "name": "Movies",
+        "variant": "4K",
+        "category": "movies-4k",
+        "apps": ["radarr-4k", "qbittorrent", "sabnzbd", "prowlarr", "profilarr", "overseerr"],
+    },
+    "lidarr": {
+        "id": "music",
+        "name": "Music",
+        "variant": "Standard",
+        "category": "music",
+        "apps": ["lidarr", "qbittorrent", "sabnzbd", "prowlarr"],
+    },
+}
+
 
 class StorageSettings:
-    def __init__(self, path):
-        self.path = Path(path)
+    """In-memory view derived from the Arr root-folder APIs.
+
+    Selection is persisted by API-owned Prowlarr tags, never by local files.
+    The roots and candidates in this object are only a cache of the latest API
+    read and are safe to discard on every restart.
+    """
+
+    def __init__(self):
         self._lock = threading.RLock()
-        self.data = self._load()
-
-    def _load(self):
-        try:
-            data = json.loads(self.path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            data = {}
-        mode = data.get("mode", "local")
-        if mode not in PRESETS:
-            mode = "local"
-        roots = dict(PRESETS[mode])
-        for slug, value in data.get("roots", {}).items():
-            if slug in roots:
-                try:
-                    roots[slug] = self._validate_path(value)
-                except ValueError:
-                    pass
-        return {"mode": mode, "roots": roots}
-
-    @staticmethod
-    def _validate_path(value):
-        value = str(value).strip().rstrip("/") or "/"
-        path = PurePosixPath(value)
-        if not path.is_absolute() or ".." in path.parts:
-            raise ValueError("Library paths must be absolute and cannot contain '..'")
-        if path.parts[:2] not in {("/", "downloads"), ("/", "network")}:
-            raise ValueError("Library paths must start with /downloads or /network")
-        return str(path)
+        self.data = {
+            "mode": "local",
+            "roots": dict(LOCAL_ROOTS),
+            "rootIds": {},
+            "candidates": {slug: [] for slug in LOCAL_ROOTS},
+            "actionRequired": False,
+        }
 
     def root(self, slug):
         with self._lock:
             return self.data["roots"][slug]
 
-    def update(self, mode, roots):
-        if mode not in PRESETS:
-            raise ValueError("Storage mode must be local or network")
-        values = {}
-        for slug in PRESETS[mode]:
-            values[slug] = self._validate_path(roots.get(slug, PRESETS[mode][slug]))
+    def update_from_apis(self, folders, mode=None, root_ids=None):
+        root_ids = {slug: int(value) for slug, value in (root_ids or {}).items()}
+        candidates = {
+            slug: [
+                {"id": int(item["id"]), "path": str(item.get("path", "")).rstrip("/") or "/"}
+                for item in folders.get(slug, [])
+                if item.get("id") is not None and item.get("path")
+            ]
+            for slug in LOCAL_ROOTS
+        }
+        selected_ids = {}
+        roots = {}
+        action_required = False
+
+        if mode in PRESETS:
+            roots = dict(PRESETS[mode])
+            for slug, path in roots.items():
+                match = next((item for item in candidates[slug] if item["path"] == path), None)
+                if match:
+                    selected_ids[slug] = match["id"]
+        elif mode == "adopted":
+            for slug in LOCAL_ROOTS:
+                match = next((item for item in candidates[slug] if item["id"] == root_ids.get(slug)), None)
+                if match is None:
+                    action_required = True
+                    continue
+                roots[slug] = match["path"]
+                selected_ids[slug] = match["id"]
+        else:
+            preset_matches = []
+            for preset_name, preset in PRESETS.items():
+                matches = {
+                    slug: next((item for item in candidates[slug] if item["path"] == path), None)
+                    for slug, path in preset.items()
+                }
+                if all(matches.values()):
+                    preset_matches.append((preset_name, preset, matches))
+            if len(preset_matches) == 1:
+                mode, preset, matches = preset_matches[0]
+                roots = dict(preset)
+                selected_ids = {slug: item["id"] for slug, item in matches.items()}
+            else:
+                mode = "adopted"
+                for slug, values in candidates.items():
+                    if len(values) == 1:
+                        roots[slug] = values[0]["path"]
+                        selected_ids[slug] = values[0]["id"]
+                    else:
+                        action_required = True
+
+        if set(roots) != set(LOCAL_ROOTS):
+            action_required = True
+            for slug in LOCAL_ROOTS:
+                roots.setdefault(slug, LOCAL_ROOTS[slug])
         with self._lock:
-            self.data = {"mode": mode, "roots": values}
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
-            temporary.replace(self.path)
+            self.data = {
+                "mode": mode,
+                "roots": roots,
+                "rootIds": selected_ids,
+                "candidates": candidates,
+                "actionRequired": action_required,
+            }
         return self.snapshot()
 
     def snapshot(self):
@@ -78,5 +149,15 @@ class StorageSettings:
             return {
                 "mode": self.data["mode"],
                 "roots": dict(self.data["roots"]),
+                "rootIds": dict(self.data["rootIds"]),
+                "candidates": {
+                    slug: [dict(item) for item in values]
+                    for slug, values in self.data["candidates"].items()
+                },
+                "actionRequired": self.data["actionRequired"],
                 "presets": {name: dict(values) for name, values in PRESETS.items()},
+                "libraries": [
+                    {"key": key, "root": self.data["roots"][key], **definition}
+                    for key, definition in LIBRARY_DEFINITIONS.items()
+                ],
             }

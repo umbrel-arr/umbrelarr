@@ -2,17 +2,19 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
-from dashboard import PAGE
+from dashboard import SERVICE_TITLES, render_page
 from reconciler import ReconcileLoop, Reconciler
 
 
 RECONCILER = Reconciler()
+ICON = Path(__file__).with_name("icon.png").read_bytes()
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "UmbrelArr/1.0"
+    server_version = "UmbrelArr/1.1"
 
     def log_message(self, _format, *_args):
         return
@@ -31,14 +33,44 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, status, value):
         self.send_body(status, "application/json", json.dumps(value))
 
+    def send_redirect(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        if path in {"/", "/index.html"}:
-            return self.send_body(200, "text/html; charset=utf-8", PAGE)
+        target = urlsplit(self.path)
+        path = target.path
+        pages = {
+            "/": "overview",
+            "/index.html": "overview",
+            "/setup": "setup",
+            "/services": "services",
+            "/dependencies": "dependencies",
+            "/libraries": "libraries",
+            "/activity": "activity",
+        }
+        if path in pages:
+            values = parse_qs(target.query)
+            mode = values.get("mode", ["basic"])[0]
+            return self.send_body(200, "text/html; charset=utf-8", render_page(pages[path], mode))
+        if path == "/settings/media":
+            suffix = f"?{target.query}" if target.query else ""
+            return self.send_redirect(f"/libraries{suffix}")
+        if path.startswith("/services/"):
+            service_id = path.removeprefix("/services/").strip("/")
+            if service_id in SERVICE_TITLES:
+                return self.send_body(200, "text/html; charset=utf-8", render_page("service", service_id=service_id))
+        if path == "/icon.png":
+            return self.send_body(200, "image/png", ICON)
         if path == "/api/status":
             return self.send_json(200, RECONCILER.runtime.snapshot())
+        if path == "/api/setup":
+            return self.send_json(200, RECONCILER.setup_snapshot())
         if path == "/api/storage":
-            return self.send_json(200, RECONCILER.storage.snapshot())
+            return self.send_json(200, RECONCILER.storage_snapshot())
         if path == "/healthz":
             return self.send_json(200, {"ok": True})
         return self.send_json(404, {"error": "Not found"})
@@ -49,19 +81,40 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         try:
             if path == "/api/reconcile":
+                self._require_setup()
                 started = RECONCILER.reconcile_async()
                 return self.send_json(202 if started else 200, {"started": started})
+            if path == "/api/setup/detect":
+                return self.send_json(200, RECONCILER.detect_apps())
+            if path == "/api/setup/confirm":
+                values = self._form()
+                try:
+                    root_ids = json.loads(values.get("rootIds", ["{}"]) [0] or "{}")
+                except json.JSONDecodeError as error:
+                    raise ValueError("rootIds must be a JSON object") from error
+                if not isinstance(root_ids, dict):
+                    raise ValueError("rootIds must be a JSON object")
+                return self.send_json(202, RECONCILER.confirm_setup(
+                    values.get("storageMode", [""])[0],
+                    root_ids,
+                    values.get("qbittorrentUsername", ["admin"])[0],
+                    values.get("qbittorrentTemporaryPassword", [""])[0],
+                ))
             if path == "/api/vpn/login":
+                self._require_setup()
                 values = self._form()
                 RECONCILER.save_vpn_login(values.get("username", [""])[0], values.get("password", [""])[0])
                 return self.send_json(202, {"accepted": True})
             if path == "/api/storage":
+                self._require_setup()
                 values = self._form()
-                roots = {
-                    slug: values.get(slug, [""])[0]
-                    for slug in ("sonarr", "sonarr-4k", "radarr", "radarr-4k", "lidarr")
-                }
-                storage = RECONCILER.save_storage(values.get("mode", ["local"])[0], roots)
+                try:
+                    root_ids = json.loads(values.get("rootIds", ["{}"]) [0] or "{}")
+                except json.JSONDecodeError as error:
+                    raise ValueError("rootIds must be a JSON object") from error
+                if not isinstance(root_ids, dict):
+                    raise ValueError("rootIds must be a JSON object")
+                storage = RECONCILER.save_storage(values.get("mode", ["local"])[0], root_ids)
                 return self.send_json(200, storage)
             return self.send_json(404, {"error": "Not found"})
         except (ValueError, RuntimeError) as error:
@@ -77,6 +130,11 @@ class Handler(BaseHTTPRequestHandler):
         if not origin:
             return True
         return origin in {f"http://{host}", f"https://{host}"}
+
+    @staticmethod
+    def _require_setup():
+        if not RECONCILER.ensure_setup_ready():
+            raise RuntimeError("Complete explicit setup before changing managed apps")
 
 
 def main():

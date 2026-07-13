@@ -10,16 +10,19 @@ SOURCE = Path(__file__).resolve().parents[1] / "app"
 ROOT = SOURCE.parent
 sys.path.insert(0, str(SOURCE))
 
-from dashboard import PAGE
-from http_client import Response
-from reconciler import Reconciler, Settings
-from state import OwnershipState, RuntimeState, ServiceStatus
-from storage import NETWORK_ROOTS, StorageSettings
+from dashboard import PAGE, render_page
+from api_keys import ApiKeyResolver
+from http_client import RequestError, Response
+from reconciler import (
+    DEPENDENCIES, PROFILARR_SYNC_MARKER_TAG, REQUIRED_APPS,
+    SETUP_MARKER_TAG, SETUP_READY_MARKER_TAG, Reconciler, Settings,
+)
+from state import RuntimeState, ServiceStatus
+from storage import LIBRARY_DEFINITIONS, LOCAL_ROOTS, NETWORK_ROOTS, StorageSettings
 
 
-def environment(state_dir):
+def environment(_state_dir=None):
     values = {
-        "STATE_DIR": str(state_dir),
         "DEVICE_DOMAIN_NAME": "umbrel.local",
         "UMBREL_ARR_PRIVADO_VPN_URL": "http://vpn:8080",
         "UMBREL_ARR_FLARESOLVERR_URL": "http://flare:8191",
@@ -36,6 +39,7 @@ def environment(state_dir):
         "UMBREL_ARR_LIDARR_URL": "http://lidarr:8686",
         "UMBREL_ARR_PRIVADO_SOCKS_HOST": "vpn",
         "UMBREL_ARR_PRIVADO_SOCKS_PORT": "1080",
+        "UMBREL_ARR_QBITTORRENT_PASSWORD": "umbrel-password",
     }
     for slug in ("prowlarr", "sabnzbd", "sonarr", "sonarr_4k", "radarr", "radarr_4k", "bazarr", "overseerr", "lidarr"):
         values[f"UMBREL_ARR_{slug.upper()}_API_KEY"] = f"{slug}-key"
@@ -46,6 +50,8 @@ class FakeClient:
     def __init__(self):
         self.calls = []
         self.vpn = {"credentialsConfigured": False, "state": "down"}
+        self.tags = []
+        self.roots = {}
 
     def request(self, method, url, headers=None, body=None, timeout=20):
         self.calls.append(("request", method, url, headers, body))
@@ -53,13 +59,95 @@ class FakeClient:
 
     def form(self, method, url, values, headers=None):
         self.calls.append(("form", method, url, headers, values))
+        if url.endswith("/api/v2/auth/login"):
+            return Response(200, {"Set-Cookie": "SID=test-session; HttpOnly; path=/"}, b"Ok.")
         return Response(200, {}, b"{}")
 
     def json(self, method, url, api_key=None, payload=None, headers=None):
         self.calls.append(("json", method, url, api_key, payload, headers))
         if url.endswith("/api/status"):
             return self.vpn
+        if url.endswith("/api/v1/tag"):
+            if method == "POST":
+                item = {**payload, "id": len(self.tags) + 1}
+                self.tags.append(item)
+                return item
+            return [dict(item) for item in self.tags]
+        if "/api/" in url and url.endswith("/rootfolder"):
+            host = url.split("/api/", 1)[0]
+            roots = self.roots.setdefault(host, [])
+            if method == "POST":
+                item = {**payload, "id": len(roots) + 1}
+                roots.append(item)
+                return item
+            return [dict(item) for item in roots]
+        if url.endswith("/metadataprofile"):
+            return [{"id": 3, "name": "Standard"}]
+        if url.endswith("/qualityprofile"):
+            return [{"id": 4, "name": "Any"}]
         return {}
+
+
+class QbitAuthClient(FakeClient):
+    def __init__(self, active_password="temporary-password", allow_unauthenticated=False):
+        super().__init__()
+        self.active_password = active_password
+        self.allow_unauthenticated = allow_unauthenticated
+        self.preferences = {"web_ui_domain_list": "existing.example"}
+
+    def request(self, method, url, headers=None, body=None, timeout=20):
+        if url.endswith("/api/v2/app/version"):
+            self.calls.append(("request", method, url, headers, body))
+            if self.allow_unauthenticated or (headers or {}).get("Cookie") == "SID=test-session":
+                return Response(200, {}, b"5.0.0")
+            raise RequestError("HTTP 403", 403)
+        return super().request(method, url, headers, body, timeout)
+
+    def form(self, method, url, values, headers=None):
+        self.calls.append(("form", method, url, headers, values))
+        if url.endswith("/api/v2/auth/login"):
+            if values["password"] != self.active_password:
+                return Response(200, {}, b"Fails.")
+            return Response(200, {"Set-Cookie": "SID=test-session; HttpOnly; path=/"}, b"Ok.")
+        if url.endswith("/api/v2/app/setPreferences"):
+            changed = json.loads(values["json"])
+            self.preferences.update(changed)
+            if changed.get("web_ui_password"):
+                self.active_password = changed["web_ui_password"]
+            return Response(200, {}, b"")
+        return Response(200, {}, b"{}")
+
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        if url.endswith("/api/v2/app/preferences"):
+            self.calls.append(("json", method, url, api_key, payload, headers))
+            return dict(self.preferences)
+        return super().json(method, url, api_key, payload, headers)
+
+
+class ProfilarrClient(FakeClient):
+    def __init__(self, fail_sync_id=None):
+        super().__init__()
+        self.fail_sync_id = fail_sync_id
+        self.instances = [
+            {"id": index + 1, "name": name}
+            for index, name in enumerate(("Sonarr", "Sonarr 4K", "Radarr", "Radarr 4K"))
+        ]
+
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        if url.endswith("/api/v1/status"):
+            return {"ok": True}
+        if url.endswith("/api/v1/databases"):
+            return [{"id": 1, "name": "Dictionarry", "repository_url": "https://github.com/Dictionarry-Hub/database"}]
+        if url.endswith("/api/v1/arr"):
+            return [dict(item) for item in self.instances]
+        return super().json(method, url, api_key, payload, headers)
+
+    def form(self, method, url, values, headers=None):
+        if "/sync?/syncQualityProfiles" in url and self.fail_sync_id is not None:
+            instance_id = int(url.split("/arr/", 1)[1].split("/", 1)[0])
+            if instance_id == self.fail_sync_id:
+                raise RequestError("sync failed", 500)
+        return super().form(method, url, values, headers)
 
 
 def schema(implementation, fields):
@@ -167,6 +255,187 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(instances["radarr-4k"], ("/downloads/movies-4k", "movies-4k", True))
         self.assertEqual(instances["lidarr"], ("/downloads/music", "music", False))
 
+    def test_reconciliation_is_blocked_until_explicit_setup(self):
+        snapshot = self.reconciler.setup_snapshot()
+        self.assertFalse(snapshot["confirmed"])
+        services = {item["id"]: item for item in self.reconciler.runtime.snapshot()["services"]}
+        self.assertEqual(services["umbrelarr"]["status"], "action_required")
+        with self.assertRaisesRegex(RuntimeError, "Complete app discovery"):
+            self.reconciler.reconcile_async()
+
+    def test_detection_is_read_only_and_finds_installed_apps(self):
+        snapshot = self.reconciler.detect_apps()
+        self.assertTrue(snapshot["canConfirm"])
+        self.assertEqual(snapshot["phase"], "ready")
+        self.assertFalse(snapshot["confirmed"])
+        self.assertTrue(snapshot["canConfirm"])
+        self.assertEqual(snapshot["detectedCount"], len(REQUIRED_APPS))
+        requests = [call for call in self.client.calls if call[0] == "request"]
+        self.assertEqual(len(requests), len(REQUIRED_APPS))
+        self.assertTrue(all(call[1] == "GET" for call in requests))
+        self.assertFalse(any(call[1] in {"POST", "PUT", "DELETE"} for call in self.client.calls))
+        self.assertTrue(all({"reachable", "credentials", "action"} <= item.keys() for item in snapshot["apps"]))
+
+    def test_confirmation_rejects_missing_storage_choice(self):
+        self.reconciler.detect_apps()
+        with self.assertRaisesRegex(ValueError, "Choose local"):
+            self.reconciler.confirm_setup()
+        self.assertFalse(any(item.get("label") == SETUP_MARKER_TAG for item in self.client.tags))
+
+    def test_confirmation_rejects_missing_generated_api_key(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_SONARR_API_KEY"] = ""
+        reconciler = Reconciler(Settings(values), self.client)
+        snapshot = reconciler.detect_apps()
+        self.assertFalse(snapshot["canConfirm"])
+        with self.assertRaisesRegex(ValueError, "Sonarr"):
+            reconciler.confirm_setup("local")
+
+    def test_confirmation_reports_missing_temporary_qbittorrent_password_after_deterministic_attempt(self):
+        client = QbitAuthClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        snapshot = reconciler.detect_apps()
+        qbit = next(item for item in snapshot["apps"] if item["id"] == "qbittorrent")
+        self.assertEqual(qbit["action"], "temporary_password_required")
+        with self.assertRaisesRegex(ValueError, "one-time admin password"):
+            reconciler.confirm_setup("local")
+        self.assertTrue(any(item.get("label") == SETUP_MARKER_TAG for item in client.tags))
+
+    def test_fresh_qbittorrent_uses_temporary_password_and_secure_api_preferences(self):
+        client = QbitAuthClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler._onboard_qbittorrent("admin", "temporary-password")
+        self.assertEqual(client.active_password, "umbrel-password")
+        self.assertTrue(client.preferences["web_ui_csrf_protection_enabled"])
+        self.assertTrue(client.preferences["web_ui_clickjacking_protection_enabled"])
+        self.assertTrue(client.preferences["web_ui_host_header_validation_enabled"])
+        self.assertFalse(client.preferences["web_ui_secure_cookie_enabled"])
+        self.assertFalse(client.preferences["web_ui_upnp"])
+        self.assertFalse(client.preferences["bypass_local_auth"])
+        self.assertFalse(client.preferences["bypass_auth_subnet_whitelist_enabled"])
+        self.assertEqual(client.preferences["bypass_auth_subnet_whitelist"], "")
+        self.assertIn("qbit", client.preferences["web_ui_domain_list"])
+        preference_call = next(call for call in client.calls if call[0] == "form" and call[2].endswith("setPreferences"))
+        self.assertEqual(preference_call[3]["Cookie"], "SID=test-session")
+
+    def test_legacy_unauthenticated_qbittorrent_is_secured_then_reauthenticated(self):
+        client = QbitAuthClient(allow_unauthenticated=True)
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler._onboard_qbittorrent("admin", "")
+        self.assertEqual(client.active_password, "umbrel-password")
+        self.assertEqual(reconciler._qbittorrent_cookie, "SID=test-session")
+
+    def test_already_configured_qbittorrent_uses_deterministic_password(self):
+        client = QbitAuthClient(active_password="umbrel-password")
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler._onboard_qbittorrent("admin", "")
+        login = next(call for call in client.calls if call[0] == "form" and call[2].endswith("auth/login"))
+        self.assertEqual(login[4]["password"], "umbrel-password")
+        self.assertEqual(login[3]["Origin"], "http://qbit:8080")
+
+    def test_consent_marker_survives_failed_qbittorrent_onboarding(self):
+        client = QbitAuthClient(active_password="different")
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler.detect_apps()
+        with self.assertRaisesRegex(ValueError, "one-time admin password"):
+            reconciler.confirm_setup("local", qbittorrent_temporary_password="wrong")
+        self.assertTrue(any(item.get("label") == SETUP_MARKER_TAG for item in client.tags))
+        client.calls.clear()
+        reconciler.reconcile()
+        with self.assertRaisesRegex(RuntimeError, "Complete app discovery"):
+            reconciler.reconcile_async()
+        self.assertFalse(any(call[1] in {"POST", "PUT", "DELETE"} for call in client.calls))
+        retry = reconciler.setup_snapshot()
+        self.assertTrue(retry["confirmed"])
+        self.assertEqual(retry["phase"], "action_required")
+        client.active_password = "correct-temporary"
+        reconciler.reconcile_async = lambda: True
+        completed = reconciler.confirm_setup(
+            "local", qbittorrent_temporary_password="correct-temporary",
+        )
+        self.assertEqual(completed["phase"], "confirmed")
+        self.assertTrue(any(item.get("label") == SETUP_READY_MARKER_TAG for item in client.tags))
+        restored = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(restored.ensure_setup())
+        self.assertEqual(restored.setup_snapshot()["phase"], "confirmed")
+
+    def test_invalid_adopted_storage_is_rejected_before_consent_or_mutation(self):
+        client = QbitAuthClient(allow_unauthenticated=True)
+        for slug, path in LOCAL_ROOTS.items():
+            client.roots[Settings(environment()).url(slug)] = [{"id": 1, "path": path}]
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler.detect_apps()
+        client.calls.clear()
+        with self.assertRaisesRegex(ValueError, "root-folder ID"):
+            reconciler.confirm_setup("adopt", {"sonarr": 1})
+        self.assertFalse(any(item.get("label") == SETUP_MARKER_TAG for item in client.tags))
+        self.assertFalse(any(call[1] in {"POST", "PUT", "DELETE"} for call in client.calls))
+
+    def test_adopted_root_ids_restore_from_prowlarr_api_markers(self):
+        client = FakeClient()
+        for index, (slug, local_path) in enumerate(LOCAL_ROOTS.items()):
+            host = Settings(environment()).url(slug)
+            client.roots[host] = [
+                {"id": 1, "path": local_path},
+                {"id": 2, "path": NETWORK_ROOTS[slug]},
+            ]
+        reconciler = Reconciler(Settings(environment()), client)
+        reconciler._setup_complete = True
+        reconciler._setup_ready = True
+        reconciler.reconcile_async = lambda: True
+        selected = reconciler.save_storage("adopt", {slug: 2 for slug in LOCAL_ROOTS})
+        self.assertEqual(selected["roots"], NETWORK_ROOTS)
+        restored = Reconciler(Settings(environment()), client)
+        snapshot = restored.storage_snapshot()
+        self.assertEqual(snapshot["mode"], "adopted")
+        self.assertEqual(snapshot["rootIds"], {slug: 2 for slug in LOCAL_ROOTS})
+        self.assertFalse(snapshot["actionRequired"])
+
+    def test_ready_marker_without_consent_cannot_authorize_mutations(self):
+        client = FakeClient()
+        client.tags.append({"id": 1, "label": SETUP_READY_MARKER_TAG})
+        reconciler = Reconciler(Settings(environment()), client)
+        self.assertFalse(reconciler.ensure_setup_ready())
+        snapshot = reconciler.setup_snapshot()
+        self.assertFalse(snapshot["confirmed"])
+        self.assertNotEqual(snapshot["phase"], "confirmed")
+        with self.assertRaises(RuntimeError):
+            reconciler.reconcile_async()
+
+    def test_confirmation_persists_setup_as_a_prowlarr_api_marker(self):
+        client = StackClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler.detect_apps()
+        reconciler.reconcile_async = lambda: True
+
+        snapshot = reconciler.confirm_setup("local")
+
+        self.assertTrue(snapshot["confirmed"])
+        self.assertIn({"label": SETUP_MARKER_TAG, "id": 1}, client.tags)
+        self.assertTrue(any(item.get("label") == SETUP_READY_MARKER_TAG for item in client.tags))
+        restored = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(restored.ensure_setup())
+        self.assertEqual(restored.setup_snapshot()["phase"], "confirmed")
+
+    def test_detection_reports_an_unreachable_required_app(self):
+        original = self.client.request
+
+        def request(method, url, headers=None, body=None, timeout=20):
+            if url.startswith("http://lidarr:"):
+                raise RequestError("unreachable")
+            return original(method, url, headers, body, timeout)
+
+        self.client.request = request
+        snapshot = self.reconciler.detect_apps()
+        self.assertFalse(snapshot["canConfirm"])
+        lidarr = next(item for item in snapshot["apps"] if item["id"] == "lidarr")
+        self.assertFalse(lidarr["detected"])
+
+    def test_environment_api_key_overrides_discovery(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_MANAGED_CONFIG_DIR"] = str(Path(self.temp.name) / "managed")
+        self.assertEqual(Settings(values).key("sonarr"), "sonarr-key")
+
     def test_vpn_requires_login_then_reports_health(self):
         self.assertEqual(self.reconciler.check_vpn()[0], "action_required")
         self.client.vpn = {"credentialsConfigured": True, "state": "healthy", "publicIp": "203.0.113.7"}
@@ -180,6 +449,18 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(call[4]["username"], "member")
         self.assertEqual(call[4]["password"], "very-secret")
         self.assertFalse(any("very-secret" in path.read_text() for path in Path(self.temp.name).glob("**/*") if path.is_file()))
+
+    def test_library_save_applies_roots_then_starts_api_reconciliation(self):
+        started = []
+        self.reconciler.reconcile_async = lambda: started.append(True) or True
+        self.reconciler._setup_complete = True
+        self.reconciler._setup_ready = True
+        snapshot = self.reconciler.save_storage("network", {})
+        self.assertEqual(snapshot["mode"], "network")
+        self.assertEqual(self.reconciler.arrs[0].root, "/network/shows")
+        self.assertEqual(started, [True])
+        event = self.reconciler.runtime.snapshot()["events"][0]["message"]
+        self.assertIn("applied through service APIs", event)
 
     def test_qbittorrent_configures_proxy_and_five_categories(self):
         detail = self.reconciler.configure_qbittorrent(True)
@@ -204,6 +485,24 @@ class ReconcilerTests(unittest.TestCase):
         call = next(call for call in self.client.calls if call[0] == "form")
         self.assertEqual(call[3]["Origin"], "http://profilarr:6868")
         self.assertEqual(call[3]["Referer"], "http://profilarr:6868/")
+
+    def test_profilarr_marker_is_created_only_after_all_initial_syncs_are_accepted(self):
+        client = ProfilarrClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler.configure_profilarr()
+        sync_calls = [call for call in client.calls if call[0] == "form" and "/sync?/syncQualityProfiles" in call[2]]
+        self.assertEqual(len(sync_calls), 4)
+        self.assertTrue(any(item.get("label") == PROFILARR_SYNC_MARKER_TAG for item in client.tags))
+        reconciler.configure_profilarr()
+        sync_calls = [call for call in client.calls if call[0] == "form" and "/sync?/syncQualityProfiles" in call[2]]
+        self.assertEqual(len(sync_calls), 4)
+
+    def test_profilarr_failed_initial_sync_does_not_create_marker(self):
+        client = ProfilarrClient(fail_sync_id=3)
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        with self.assertRaises(RequestError):
+            reconciler.configure_profilarr()
+        self.assertFalse(any(item.get("label") == PROFILARR_SYNC_MARKER_TAG for item in client.tags))
 
     def test_overseerr_profile_preferences_are_deterministic(self):
         profiles = [{"id": 1, "name": "Any"}, {"id": 2, "name": "1080p Quality HDR"}, {"id": 3, "name": "2160p Quality"}]
@@ -238,6 +537,8 @@ class ReconcilerTests(unittest.TestCase):
 
     def test_prelogin_reconciliation_waits_without_false_failures(self):
         reconciler = Reconciler(Settings(environment(self.temp.name)), self.client)
+        reconciler._setup_complete = True
+        reconciler._setup_ready = True
         reconciler.configure_storage = lambda: "Storage ready"
         reconciler.check_vpn = lambda: ("action_required", "Enter Privado login")
         reconciler.check_flaresolverr = lambda: self.fail("FlareSolverr should wait for VPN")
@@ -257,6 +558,22 @@ class ReconcilerTests(unittest.TestCase):
         self.assertTrue(all(services[slug]["status"] == "waiting" for slug in waiting))
         self.assertEqual(snapshot["counts"]["failed"], 0)
 
+    def test_dependency_graph_matches_reconciliation_prerequisites(self):
+        self.assertEqual(DEPENDENCIES["flaresolverr"], ("privado-vpn",))
+        self.assertEqual(DEPENDENCIES["qbittorrent"], ("privado-vpn",))
+        self.assertEqual(DEPENDENCIES["sonarr"], ("umbrelarr", "qbittorrent", "sabnzbd"))
+        self.assertIn("flaresolverr", DEPENDENCIES["prowlarr"])
+        self.assertEqual(DEPENDENCIES["bazarr"], ("privado-vpn", "sonarr", "radarr"))
+
+    def test_missing_bazarr_key_waits_for_app_persistence(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_BAZARR_API_KEY"] = ""
+        reconciler = Reconciler(Settings(values), self.client)
+        self.assertEqual(
+            reconciler.configure_bazarr(True),
+            ("waiting", "Waiting for Bazarr to persist its API key"),
+        )
+
     def test_prowlarr_configuration_is_idempotent(self):
         client = StackClient()
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)
@@ -274,6 +591,31 @@ class ReconcilerTests(unittest.TestCase):
         self.assertNotIn("hunter2", safe)
         self.assertNotIn("abc", safe)
         self.assertNotIn("xyz", safe)
+        json_safe = self.reconciler._safe_error(RuntimeError('{"password":"fresh-secret","apiKey":"key-secret"}'))
+        self.assertNotIn("fresh-secret", json_safe)
+        self.assertNotIn("key-secret", json_safe)
+        secret = "unique-runtime-secret-938"
+        self.reconciler._step(
+            "qbittorrent",
+            lambda: (_ for _ in ()).throw(RuntimeError(f'{{"password":"{secret}"}}')),
+        )
+        rendered = json.dumps(self.reconciler.runtime.snapshot())
+        self.assertNotIn(secret, rendered)
+
+    def test_mutating_http_endpoints_share_the_setup_gate(self):
+        import app as web_app
+        previous = web_app.RECONCILER
+        web_app.RECONCILER = self.reconciler
+        try:
+            with self.assertRaisesRegex(RuntimeError, "Complete explicit setup"):
+                web_app.Handler._require_setup()
+            self.reconciler._setup_complete = True
+            with self.assertRaisesRegex(RuntimeError, "Complete explicit setup"):
+                web_app.Handler._require_setup()
+            self.reconciler._setup_ready = True
+            web_app.Handler._require_setup()
+        finally:
+            web_app.RECONCILER = previous
 
 
 class StateTests(unittest.TestCase):
@@ -284,40 +626,156 @@ class StateTests(unittest.TestCase):
         self.assertEqual(snapshot["counts"]["healthy"], 1)
         self.assertEqual(snapshot["counts"]["unknown"], 1)
 
-    def test_ownership_state_is_persistent(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "ownership.json"
-            state = OwnershipState(path)
-            state.set("resource", {"id": 4})
-            self.assertEqual(OwnershipState(path).get("resource"), {"id": 4})
+    def test_runtime_state_reports_current_upstream_blockers(self):
+        state = RuntimeState(
+            [ServiceStatus("vpn", "VPN"), ServiceStatus("client", "Client")],
+            {"vpn": (), "client": ("vpn",)},
+        )
+        state.set("vpn", "waiting", "Connecting")
+        state.set("client", "waiting", "Waiting for VPN")
+        services = {service["id"]: service for service in state.snapshot()["services"]}
+        self.assertEqual(services["client"]["dependencies"], ["vpn"])
+        self.assertEqual(services["client"]["waitingOn"], ["vpn"])
+        state.set("vpn", "healthy", "Ready")
+        services = {service["id"]: service for service in state.snapshot()["services"]}
+        self.assertEqual(services["client"]["waitingOn"], [])
 
-    def test_storage_settings_switch_between_local_and_network_roots(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "storage.json"
-            storage = StorageSettings(path)
-            self.assertEqual(storage.root("radarr"), "/downloads/movies")
-            storage.update("network", {})
-            self.assertEqual(storage.root("radarr"), NETWORK_ROOTS["radarr"])
-            self.assertEqual(StorageSettings(path).snapshot()["mode"], "network")
+    def test_storage_is_derived_from_api_root_ids_without_files(self):
+        storage = StorageSettings()
+        folders = {
+            slug: [{"id": index + 10, "path": path}]
+            for index, (slug, path) in enumerate(NETWORK_ROOTS.items())
+        }
+        snapshot = storage.update_from_apis(folders)
+        self.assertEqual(snapshot["mode"], "network")
+        self.assertEqual(snapshot["roots"], NETWORK_ROOTS)
+        self.assertFalse(snapshot["actionRequired"])
+        self.assertEqual(len(snapshot["libraries"]), 5)
+        self.assertIn("overseerr", LIBRARY_DEFINITIONS["radarr-4k"]["apps"])
 
-    def test_storage_settings_reject_paths_outside_shared_mounts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            storage = StorageSettings(Path(directory) / "storage.json")
-            with self.assertRaisesRegex(ValueError, "/downloads or /network"):
-                storage.update("local", {"radarr": "/etc/movies"})
+    def test_multiple_existing_roots_require_an_explicit_api_selection(self):
+        storage = StorageSettings()
+        folders = {
+            slug: [
+                {"id": 1, "path": LOCAL_ROOTS[slug]},
+                {"id": 2, "path": NETWORK_ROOTS[slug]},
+            ]
+            for slug in LOCAL_ROOTS
+        }
+        snapshot = storage.update_from_apis(folders)
+        self.assertEqual(snapshot["mode"], "adopted")
+        self.assertTrue(snapshot["actionRequired"])
+        selected = storage.update_from_apis(folders, "adopted", {slug: 2 for slug in folders})
+        self.assertEqual(selected["roots"], NETWORK_ROOTS)
+        self.assertFalse(selected["actionRequired"])
+
+
+class ApiKeyResolverTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.resolver = ApiKeyResolver(self.root)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write(self, relative, value):
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value)
+
+    def test_extracts_every_supported_app_key_format(self):
+        for slug in ("prowlarr", "sonarr", "sonarr-4k", "radarr", "radarr-4k", "lidarr"):
+            self.write(f"{slug}/config.xml", f"<Config><ApiKey>{slug}-generated-key-123456</ApiKey></Config>")
+        self.write("sabnzbd/sabnzbd.ini", "__encoding__ = utf-8\n[misc]\napi_key = sabnzbd-generated-key-123456\n")
+        self.write("bazarr/config/config.yaml", "auth:\n  apikey: bazarr-generated-key-123456\ngeneral:\n  flask_secret_key: ignored\n")
+        self.write("overseerr/settings.json", json.dumps({"main": {"apiKey": "overseerr-generated-key-123456"}}))
+
+        expected = {
+            "prowlarr", "sonarr", "sonarr-4k", "radarr", "radarr-4k", "lidarr",
+            "sabnzbd", "bazarr", "overseerr",
+        }
+        self.assertEqual({slug for slug in expected if self.resolver.resolve(slug)}, expected)
+        self.assertEqual(self.resolver.resolve("bazarr"), "bazarr-generated-key-123456")
+        self.assertEqual(self.resolver.resolve("overseerr"), "overseerr-generated-key-123456")
+
+    def test_missing_malformed_and_unsupported_sources_are_safe(self):
+        self.write("sonarr/config.xml", "<Config><ApiKey>")
+        self.write("overseerr/settings.json", "not-json")
+        self.assertEqual(self.resolver.resolve("sonarr"), "")
+        self.assertEqual(self.resolver.resolve("overseerr"), "")
+        self.assertEqual(self.resolver.resolve("qbittorrent"), "")
 
 
 class DashboardTests(unittest.TestCase):
     def test_dashboard_is_operational_and_accessible(self):
-        self.assertIn("<table>", PAGE)
         self.assertIn("<title>umbrelarr</title>", PAGE)
+        self.assertIn('rel="icon" href="/icon.png"', PAGE)
+        self.assertIn('<img src="/icon.png" alt="">', PAGE)
         self.assertIn("Privado login required", PAGE)
         self.assertIn("aria-label=\"Stack summary\"", PAGE)
-        self.assertIn("Library locations", PAGE)
-        self.assertIn("Linked /network storage", PAGE)
+        self.assertIn("aria-label=\"Primary navigation\"", PAGE)
+        self.assertIn('href="/libraries"', PAGE)
         self.assertIn("Reconcile", PAGE)
-        self.assertNotIn("linear-gradient", PAGE)
-        self.assertNotIn("border-radius:999", PAGE)
+        self.assertIn("@media (max-width: 560px)", PAGE)
+        for status in ("unknown", "waiting", "action_required", "configuring", "healthy", "failed"):
+            self.assertIn(status, PAGE)
+        self.assertIn("--sidebar: #20242a", PAGE)
+        self.assertIn("--canvas: #f5f6f8", PAGE)
+        self.assertIn("--primary: #2e8b57", PAGE)
+        self.assertNotIn("radial-gradient", PAGE)
+        self.assertIn("border-radius: 10px", PAGE)
+        self.assertIn("prefers-reduced-motion", PAGE)
+
+    def test_dashboard_routes_render_only_their_task(self):
+        setup = render_page("setup")
+        services = render_page("services")
+        service = render_page("service", service_id="sonarr")
+        dependencies = render_page("dependencies")
+        libraries = render_page("libraries")
+        activity = render_page("activity")
+        self.assertIn('id="detectApps"', setup)
+        self.assertIn('id="confirmSetup"', setup)
+        self.assertIn("does not create containers", setup)
+        self.assertIn('aria-current="page" href="/setup"', setup)
+        self.assertIn('id="serviceGrid"', services)
+        self.assertIn('id="serviceSearch"', services)
+        self.assertNotIn('/api/containers', services)
+        self.assertNotIn('<tbody id="serviceRows">', services)
+        self.assertNotIn('href="/containers"', services)
+        self.assertNotIn('id="storageForm"', services)
+        self.assertIn('data-service-id="sonarr"', service)
+        self.assertIn('id="detailDependencies"', service)
+        self.assertNotIn('id="containerLogs"', service)
+        self.assertIn('aria-current="page" href="/services"', service)
+        self.assertIn('id="dependencyGraph"', dependencies)
+        self.assertIn('id="dependencyRows"', dependencies)
+        self.assertNotIn('id="serviceGrid"', dependencies)
+        self.assertIn('id="storageForm"', libraries)
+        self.assertIn('id="libraryPlan"', libraries)
+        self.assertIn("Reconcile scope", libraries)
+        self.assertIn("Save library layout", libraries)
+        self.assertNotIn("Apply libraries to managed apps", libraries)
+        self.assertNotIn('id="serviceGrid"', libraries)
+        self.assertIn('id="events"', activity)
+        self.assertNotIn('id="storageForm"', activity)
+
+    def test_unknown_service_detail_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unknown managed service"):
+            render_page("service", service_id="not-owned")
+
+    def test_library_settings_have_basic_and_expert_modes(self):
+        basic = render_page("libraries", "basic")
+        expert = render_page("libraries", "expert")
+        self.assertIn("Basic mode applies a complete, safe five-library layout", basic)
+        self.assertIn('data-level="basic"', basic)
+        self.assertIn('value="adopt"', basic)
+        self.assertIn('id="storageRootSelections"', basic)
+        self.assertIn('aria-current="page" href="/libraries"', basic)
+        self.assertIn("Expert mode can adopt one existing API-reported root ID", expert)
+        self.assertIn('data-level="expert"', expert)
+        self.assertNotIn('name="sonarr" required', expert)
+        self.assertNotIn("/api/containers", expert)
 
 
 class ImageTests(unittest.TestCase):
@@ -325,6 +783,21 @@ class ImageTests(unittest.TestCase):
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("adduser -S -D -H -u 1000", dockerfile)
         self.assertIn("USER umbrelarr", dockerfile)
+
+    def test_control_plane_has_no_docker_socket_or_persistent_state(self):
+        dockerfile = (ROOT / "Dockerfile").read_text()
+        app = (ROOT / "app" / "app.py").read_text()
+        self.assertNotIn("/data", dockerfile)
+        self.assertNotIn("STATE_DIR", dockerfile)
+        self.assertIn("PYTHONDONTWRITEBYTECODE=1", dockerfile)
+        self.assertNotIn("containers", app)
+        self.assertFalse((ROOT / "app" / "containers.py").exists())
+        self.assertFalse((ROOT / "compose.local.yml").exists())
+
+    def test_runtime_sources_do_not_write_files(self):
+        sources = "\n".join(path.read_text() for path in (ROOT / "app").glob("*.py"))
+        for mutation in (".mkdir(", ".write_text(", ".write_bytes(", ".unlink("):
+            self.assertNotIn(mutation, sources)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,6 @@
-import json
 import threading
 import time
 from dataclasses import asdict, dataclass
-from pathlib import Path
 
 
 VALID_STATES = {"unknown", "waiting", "action_required", "configuring", "healthy", "failed"}
@@ -19,9 +17,13 @@ class ServiceStatus:
 
 
 class RuntimeState:
-    def __init__(self, services):
+    def __init__(self, services, dependencies=None):
         self._lock = threading.RLock()
         self.services = {service.id: service for service in services}
+        self.dependencies = {
+            service_id: tuple(upstream)
+            for service_id, upstream in (dependencies or {}).items()
+        }
         self.running = False
         self.last_started_at = 0
         self.last_completed_at = 0
@@ -60,34 +62,22 @@ class RuntimeState:
             counts = {state: 0 for state in VALID_STATES}
             for service in values:
                 counts[service.status] += 1
+            services = []
+            for service in values:
+                value = asdict(service)
+                upstream = self.dependencies.get(service.id, ())
+                value["dependencies"] = list(upstream)
+                value["waitingOn"] = [
+                    service_id
+                    for service_id in upstream
+                    if self.services[service_id].status != "healthy"
+                ]
+                services.append(value)
             return {
                 "running": self.running,
                 "lastStartedAt": self.last_started_at,
                 "lastCompletedAt": self.last_completed_at,
                 "counts": counts,
-                "services": [asdict(service) for service in values],
+                "services": services,
                 "events": list(self.events),
             }
-
-
-class OwnershipState:
-    def __init__(self, path):
-        self.path = Path(path)
-        self._lock = threading.Lock()
-        self.data = {}
-        try:
-            self.data = json.loads(self.path.read_text())
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            self.data = {}
-
-    def get(self, key, default=None):
-        with self._lock:
-            return self.data.get(key, default)
-
-    def set(self, key, value):
-        with self._lock:
-            self.data[key] = value
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            temporary = self.path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
-            temporary.replace(self.path)
