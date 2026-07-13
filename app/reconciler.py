@@ -585,7 +585,10 @@ class Reconciler:
             return False
         cookie = response.headers.get("Set-Cookie", "") if response.headers else ""
         self._qbittorrent_cookie = cookie.split(";", 1)[0]
-        return self._qbittorrent_cookie.startswith("SID=")
+        cookie_name, separator, _value = self._qbittorrent_cookie.partition("=")
+        return bool(separator) and (
+            cookie_name == "SID" or cookie_name.startswith("QBT_SID_")
+        )
 
     def _qbit_headers(self):
         origin = self.settings.url("qbittorrent")
