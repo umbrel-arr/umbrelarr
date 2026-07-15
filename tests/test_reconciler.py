@@ -720,14 +720,18 @@ class ReconcilerTests(unittest.TestCase):
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)
         arr = reconciler.arrs[2]
         reconciler.configure_arr(arr)
+        qbittorrent = next(item for item in client.clients if item["name"] == "Umbrel Arr qBittorrent")
+        qbittorrent["fields"].append({"name": "userOwnedSetting", "value": "preserve-me"})
+        put_count = sum(call[1] == "PUT" for call in client.calls)
         reconciler.configure_arr(arr)
         self.assertEqual(client.roots, [{"path": "/downloads/movies", "id": 1}])
         self.assertEqual(len(client.clients), 2)
         self.assertEqual({item["name"] for item in client.clients}, {"Umbrel Arr qBittorrent", "Umbrel Arr SABnzbd"})
-        qbittorrent = next(item for item in client.clients if item["name"] == "Umbrel Arr qBittorrent")
+        self.assertEqual(sum(call[1] == "PUT" for call in client.calls), put_count)
         fields = {field["name"]: field["value"] for field in qbittorrent["fields"]}
         self.assertEqual(fields["username"], "admin")
         self.assertEqual(fields["password"], "umbrel-password")
+        self.assertEqual(fields["userOwnedSetting"], "preserve-me")
 
     def test_lidarr_root_includes_its_required_name(self):
         client = StackClient()
@@ -788,13 +792,23 @@ class ReconcilerTests(unittest.TestCase):
         client = StackClient()
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)
         reconciler.configure_prowlarr(True)
+        client.proxies[0]["fields"].append({"name": "userOwnedSetting", "value": "preserve-me"})
+        client.applications[0]["fields"].append({"name": "userOwnedSetting", "value": "preserve-me"})
+        client.host_config["userOwnedSetting"] = "preserve-me"
+        put_count = sum(call[1] == "PUT" for call in client.calls)
         reconciler.configure_prowlarr(True)
         self.assertEqual(client.tags, [{"label": "flaresolverr", "id": 1}])
         self.assertEqual(len(client.proxies), 1)
         self.assertEqual(client.proxies[0]["tags"], [1])
         self.assertEqual(len(client.applications), 5)
+        self.assertEqual(sum(call[1] == "PUT" for call in client.calls), put_count)
         self.assertTrue(client.host_config["proxyEnabled"])
         self.assertEqual(client.host_config["proxyType"], "socks5")
+        self.assertEqual(client.host_config["userOwnedSetting"], "preserve-me")
+        proxy_fields = {field["name"]: field["value"] for field in client.proxies[0]["fields"]}
+        app_fields = {field["name"]: field["value"] for field in client.applications[0]["fields"]}
+        self.assertEqual(proxy_fields["userOwnedSetting"], "preserve-me")
+        self.assertEqual(app_fields["userOwnedSetting"], "preserve-me")
 
     def test_errors_redact_secrets(self):
         safe = self.reconciler._safe_error(RuntimeError("password=hunter2 token=abc api_key=xyz"))

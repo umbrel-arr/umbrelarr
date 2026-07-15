@@ -957,7 +957,18 @@ class Reconciler:
             })
         self._set_fields(payload, values)
         payload.update({"name": name, "enable": True, "priority": 1, "removeCompletedDownloads": True, "removeFailedDownloads": True, "tags": []})
-        self._upsert(arr.api, "downloadclient", arr.api_key, payload, existing)
+        self._upsert(
+            arr.api,
+            "downloadclient",
+            arr.api_key,
+            payload,
+            existing,
+            owned_fields=values,
+            owned_keys=(
+                "name", "enable", "priority", "removeCompletedDownloads",
+                "removeFailedDownloads", "tags",
+            ),
+        )
 
     def configure_prowlarr(self, vpn_ok):
         url = self.settings.url("prowlarr")
@@ -969,24 +980,35 @@ class Reconciler:
         proxy = self.vpn_provider.proxy(self.settings) if vpn_ok else None
         if vpn_ok:
             config = self.client.json("GET", f"{api}/config/host", key)
-            config.update({
+            desired_host = {
                 "proxyEnabled": bool(proxy),
                 "proxyType": "socks5" if proxy else config.get("proxyType", "http"),
                 "proxyHostname": proxy.host if proxy else "",
                 "proxyPort": proxy.port if proxy else 0,
                 "proxyBypassFilter": ",".join(f"umbrel-arr-{slug}_server_1" for slug in self.enabled_modules),
                 "proxyBypassLocalAddresses": True,
-            })
-            self.client.json("PUT", f"{api}/config/host/{config.get('id', 1)}", key, config)
+            }
+            if any(config.get(name) != value for name, value in desired_host.items()):
+                config.update(desired_host)
+                self.client.json("PUT", f"{api}/config/host/{config.get('id', 1)}", key, config)
         if "flaresolverr" in self.enabled_modules:
             self._configure_flaresolverr_proxy(api, key)
         schemas = self.client.json("GET", f"{api}/applications/schema", key)
         existing = self.client.json("GET", f"{api}/applications", key)
         for arr in self.arrs:
             payload = self._schema(schemas, arr.implementation)
-            self._set_fields(payload, {"prowlarrUrl": url, "baseUrl": arr.url, "apiKey": arr.api_key})
+            values = {"prowlarrUrl": url, "baseUrl": arr.url, "apiKey": arr.api_key}
+            self._set_fields(payload, values)
             payload.update({"name": f"Umbrel Arr {arr.name}", "syncLevel": "fullSync", "tags": []})
-            self._upsert(api, "applications", key, payload, existing)
+            self._upsert(
+                api,
+                "applications",
+                key,
+                payload,
+                existing,
+                owned_fields=values,
+                owned_keys=("name", "syncLevel", "tags"),
+            )
         network_note = f"{self.vpn_provider.name} routing and " if proxy else ""
         solver_note = "FlareSolverr plus " if "flaresolverr" in self.enabled_modules else ""
         return f"{network_note}{solver_note}{len(self.arrs)} full-sync Arr applications are configured"
@@ -999,9 +1021,18 @@ class Reconciler:
         schemas = self.client.json("GET", f"{api}/indexerproxy/schema", key)
         existing = self.client.json("GET", f"{api}/indexerproxy", key)
         payload = self._schema(schemas, "FlareSolverr")
-        self._set_fields(payload, {"host": self.settings.url("flaresolverr"), "requestTimeout": 60})
+        values = {"host": self.settings.url("flaresolverr"), "requestTimeout": 60}
+        self._set_fields(payload, values)
         payload.update({"name": "Umbrel Arr FlareSolverr", "tags": [tag["id"]]})
-        self._upsert(api, "indexerproxy", key, payload, existing)
+        self._upsert(
+            api,
+            "indexerproxy",
+            key,
+            payload,
+            existing,
+            owned_fields=values,
+            owned_keys=("name", "tags"),
+        )
 
     def configure_bazarr(self, vpn_ok):
         key = self.settings.key("bazarr")
@@ -1145,11 +1176,40 @@ class Reconciler:
             if name.casefold() in fields:
                 fields[name.casefold()]["value"] = value
 
-    def _upsert(self, base, route, key, payload, existing):
+    def _upsert(
+        self, base, route, key, payload, existing,
+        *, owned_fields=(), owned_keys=(),
+    ):
         match = next((item for item in existing if item.get("name") == payload.get("name")), None)
         if match:
-            payload["id"] = match["id"]
-            return self.client.json("PUT", f"{base}/{route}/{match['id']}", key, payload)
+            merged = copy.deepcopy(match)
+            desired_fields = {
+                str(field.get("name", "")).casefold(): field
+                for field in payload.get("fields", [])
+            }
+            merged_fields = merged.setdefault("fields", [])
+            current_fields = {
+                str(field.get("name", "")).casefold(): field
+                for field in merged_fields
+            }
+            for name in owned_fields:
+                normalized = str(name).casefold()
+                desired = desired_fields.get(normalized)
+                if desired is None:
+                    continue
+                current = current_fields.get(normalized)
+                if current is None:
+                    merged_fields.append(copy.deepcopy(desired))
+                    current_fields[normalized] = merged_fields[-1]
+                else:
+                    current["value"] = copy.deepcopy(desired.get("value"))
+            for name in owned_keys:
+                if name in payload:
+                    merged[name] = copy.deepcopy(payload[name])
+            merged["id"] = match["id"]
+            if merged == match:
+                return match
+            return self.client.json("PUT", f"{base}/{route}/{match['id']}", key, merged)
         payload.pop("id", None)
         created = self.client.json("POST", f"{base}/{route}", key, payload)
         if isinstance(created, dict):
