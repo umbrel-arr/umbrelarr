@@ -587,6 +587,19 @@ class ReconcilerTests(unittest.TestCase):
         self.client.vpn = {"credentialsConfigured": True, "state": "healthy", "publicIp": "203.0.113.7"}
         self.assertIn("203.0.113.7", self.reconciler.check_vpn())
 
+    def test_vpn_reports_selected_server_when_exit_ip_is_unknown(self):
+        self.client.vpn = {
+            "credentialsConfigured": True,
+            "state": "healthy",
+            "publicIp": "unknown",
+            "server": "nl.example.vpn",
+        }
+
+        self.assertEqual(
+            self.reconciler.check_vpn(),
+            "WireGuard and SOCKS5 are healthy via nl.example.vpn",
+        )
+
     def test_generic_socks_provider_probes_the_selected_endpoint(self):
         values = environment(self.temp.name)
         values["UMBREL_ARR_SOCKS5_HOST"] = "socks-gateway"

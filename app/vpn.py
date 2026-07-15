@@ -45,8 +45,9 @@ class PrivadoProvider(VpnProvider):
     def check(self, settings, client):
         status = client.json("GET", f"{settings.url(self.service_id)}/api/status")
         if status.get("state") == "healthy":
-            public_ip = status.get("publicIp") or "private exit"
-            return "healthy", f"WireGuard and SOCKS5 are healthy via {public_ip}"
+            public_ip = status.get("publicIp")
+            route = public_ip if public_ip and public_ip != "unknown" else status.get("server")
+            return "healthy", f"WireGuard and SOCKS5 are healthy via {route or 'private exit'}"
         if not status.get("credentialsConfigured"):
             return "action_required", "Enter your Privado login to start the tunnel"
         return "waiting", f"Privado is {status.get('state', 'starting')}; waiting for WireGuard and SOCKS5"
