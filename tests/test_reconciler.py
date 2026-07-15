@@ -438,6 +438,21 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(passwords[:2], ["umbrel-password", "correct-temporary"])
         self.assertEqual(client.active_password, "umbrel-password")
 
+    def test_legacy_manager_password_is_rotated_to_qbittorrent_password(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_QBITTORRENT_LEGACY_PASSWORD"] = "legacy-manager-password"
+        client = QbitAuthClient(active_password="legacy-manager-password")
+        reconciler = Reconciler(Settings(values), client)
+
+        reconciler._onboard_qbittorrent("admin", "")
+
+        passwords = [
+            call[4]["password"] for call in client.calls
+            if call[0] == "form" and call[2].endswith("auth/login")
+        ]
+        self.assertEqual(passwords[:2], ["umbrel-password", "legacy-manager-password"])
+        self.assertEqual(client.active_password, "umbrel-password")
+
     def test_current_qbittorrent_versioned_session_cookie_is_accepted(self):
         client = QbitAuthClient(session_cookie_name="QBT_SID_8080")
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)

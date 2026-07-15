@@ -92,6 +92,10 @@ class Settings:
     def qbittorrent_password(self):
         return self.env.get("UMBREL_ARR_QBITTORRENT_PASSWORD", "")
 
+    @property
+    def qbittorrent_legacy_password(self):
+        return self.env.get("UMBREL_ARR_QBITTORRENT_LEGACY_PASSWORD", "")
+
 
 class Reconciler:
     def __init__(self, settings=None, client=None):
@@ -675,8 +679,11 @@ class Reconciler:
             if error.status not in {401, 403}:
                 raise
             authenticated = False
-            if deterministic:
-                authenticated = self._qbit_login("admin", deterministic)
+            candidates = (deterministic, self.settings.qbittorrent_legacy_password)
+            for password in dict.fromkeys(candidate for candidate in candidates if candidate):
+                if self._qbit_login("admin", password):
+                    authenticated = True
+                    break
             if not authenticated and temporary_password:
                 authenticated = self._qbit_login(username.strip() or "admin", temporary_password)
             if not authenticated:

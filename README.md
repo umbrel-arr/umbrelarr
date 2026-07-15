@@ -52,6 +52,10 @@ only that selection. Review every app, choose local, network, or existing
 API-reported library roots, provide qBittorrent's one-time password if requested,
 and confirm before any managed API mutation occurs.
 
+Upgrades from 1.1 also accept the manager-owned deterministic password that the
+old dependency export could assign to qBittorrent, then immediately rotate the
+Web UI to qBittorrent's own Umbrel-derived password.
+
 If an optional service is installed after umbrelarr has already started, restart
 umbrelarr once so Umbrel can refresh the read-only credential mounts, then run
 detection again. The dashboard calls this out when an installed app is reachable
