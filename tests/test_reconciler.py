@@ -393,6 +393,8 @@ class ReconcilerTests(unittest.TestCase):
         reconciler = Reconciler(Settings(values), self.client)
         snapshot = reconciler.detect_apps()
         self.assertFalse(snapshot["canConfirm"])
+        sonarr = next(item for item in snapshot["apps"] if item["id"] == "sonarr")
+        self.assertIn("Restart umbrelarr", sonarr["detail"])
         with self.assertRaisesRegex(ValueError, "Sonarr"):
             reconciler.confirm_setup("local")
 

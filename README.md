@@ -9,10 +9,11 @@ confirmation, and then reconciles only the settings it owns through service
 APIs. It never installs or controls containers and never creates or edits
 another app's files.
 
-The matching Umbrel package has no forced service dependencies. Installed apps
-publish their internal URL and read-only credential source through Umbrel
-exports; missing exports resolve to `/dev/null`, so absent services are detected
-without Docker creating phantom app directories.
+The matching Umbrel package declares only Prowlarr as its required core
+dependency. Its own Umbrel lifecycle export discovers read-only credential
+directories for optional installed apps; missing paths resolve to `/dev/null`,
+so absent services are detected without Docker creating phantom app
+directories.
 
 ## Modular stacks
 
@@ -50,6 +51,11 @@ run detection. Detection performs read-only health and credential discovery for
 only that selection. Review every app, choose local, network, or existing
 API-reported library roots, provide qBittorrent's one-time password if requested,
 and confirm before any managed API mutation occurs.
+
+If an optional service is installed after umbrelarr has already started, restart
+umbrelarr once so Umbrel can refresh the read-only credential mounts, then run
+detection again. The dashboard calls this out when an installed app is reachable
+but its API key handoff is not yet mounted.
 
 Consent, storage selection, and the Profilarr initial-sync marker are restored
 from umbrelarr-owned Prowlarr tags. API keys may be read from app-generated

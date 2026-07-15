@@ -414,7 +414,10 @@ class Reconciler:
         else:
             credentials = slug not in KEYED_APPS or bool(self.settings.key(slug))
         if reachable and not credentials and slug != "qbittorrent":
-            detail = "Installed app found; waiting for its API key"
+            detail = (
+                "Installed app found; waiting for its API key. Restart umbrelarr "
+                "if this app was installed after umbrelarr started"
+            )
         action = "none"
         if not reachable:
             action = "install_or_start"
