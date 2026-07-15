@@ -1,9 +1,11 @@
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "app"
@@ -39,11 +41,13 @@ def environment(_state_dir=None):
         "UMBREL_ARR_OVERSEERR_URL": "http://overseerr:5055",
         "UMBREL_ARR_PROFILARR_URL": "http://profilarr:6868",
         "UMBREL_ARR_LIDARR_URL": "http://lidarr:8686",
+        "UMBREL_ARR_JELLYFIN_URL": "http://jellyfin:8096",
+        "UMBREL_ARR_PLEX_URL": "http://plex:32400",
         "UMBREL_ARR_PRIVADO_SOCKS_HOST": "vpn",
         "UMBREL_ARR_PRIVADO_SOCKS_PORT": "1080",
         "UMBREL_ARR_QBITTORRENT_PASSWORD": "umbrel-password",
     }
-    for slug in ("prowlarr", "sabnzbd", "sonarr", "sonarr_4k", "radarr", "radarr_4k", "bazarr", "overseerr", "lidarr"):
+    for slug in ("prowlarr", "sabnzbd", "sonarr", "sonarr_4k", "radarr", "radarr_4k", "bazarr", "overseerr", "lidarr", "jellyfin", "plex"):
         values[f"UMBREL_ARR_{slug.upper()}_API_KEY"] = f"{slug}-key"
     return values
 
@@ -255,6 +259,40 @@ class StackClient(FakeClient):
         return collection[index]
 
 
+class MediaServerClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.jellyfin_folders = [{"Name": "Personal Movies", "Locations": ["/personal"]}]
+        self.plex_sections = [
+            {"key": "90", "title": "Personal Movies", "Location": [{"path": "/personal"}]},
+        ]
+
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        self.calls.append(("json", method, url, api_key, payload, headers))
+        target = urlsplit(url)
+        if target.path == "/Library/VirtualFolders":
+            if method == "POST":
+                values = parse_qs(target.query)
+                self.jellyfin_folders.append({"Name": values["name"][0], "Locations": []})
+                return None
+            return [dict(item) for item in self.jellyfin_folders]
+        if target.path == "/Library/VirtualFolders/Paths" and method == "POST":
+            folder = next(item for item in self.jellyfin_folders if item["Name"] == payload["Name"])
+            folder.setdefault("Locations", []).append(payload["Path"])
+            return None
+        if target.path == "/library/sections":
+            if method == "POST":
+                values = parse_qs(target.query)
+                self.plex_sections.append({
+                    "key": str(len(self.plex_sections) + 1),
+                    "title": values["name"][0],
+                    "Location": [{"path": values["locations"][0]}],
+                })
+                return None
+            return {"MediaContainer": {"Directory": [dict(item) for item in self.plex_sections]}}
+        return super().json(method, url, api_key, payload, headers)
+
+
 class ReconcilerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -279,11 +317,20 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(dependencies["prowlarr"], ("sonarr",))
         self.assertNotIn("privado-vpn", dependencies)
         self.assertEqual(validate_modules({"bazarr"}), ["Bazarr requires Sonarr and Radarr"])
+        self.assertEqual(
+            validate_modules({"jellyfin"}),
+            ["Jellyfin requires at least one Sonarr, Radarr, or Lidarr module"],
+        )
+        media_dependencies = dependencies_for({"prowlarr", "sonarr", "jellyfin"})
+        self.assertEqual(media_dependencies["jellyfin"], ("umbrelarr", "sonarr"))
         self.assertTrue(CORE_MODULES <= set(selected))
 
     def test_every_starting_profile_is_valid_and_keeps_the_required_core(self):
         profiles = {profile.id: profile for profile in STACK_PROFILES}
-        self.assertEqual(set(profiles), {"core", "tv-torrent", "video-usenet", "full"})
+        self.assertEqual(
+            set(profiles),
+            {"core", "tv-torrent", "video-usenet", "full", "jellyfin-video", "plex-video"},
+        )
         for profile in profiles.values():
             selected = normalize_modules(profile.enabled_services)
             self.assertTrue(CORE_MODULES <= selected, profile.id)
@@ -292,6 +339,8 @@ class ReconcilerTests(unittest.TestCase):
             normalize_modules(profiles["tv-torrent"].enabled_services),
             frozenset({"umbrelarr", "prowlarr", "qbittorrent", "sonarr"}),
         )
+        self.assertNotIn("jellyfin", normalize_modules(profiles["full"].enabled_services))
+        self.assertNotIn("plex", normalize_modules(profiles["full"].enabled_services))
 
     def test_selected_modules_limit_read_only_detection(self):
         snapshot = self.reconciler.select_and_detect(
@@ -307,6 +356,74 @@ class ReconcilerTests(unittest.TestCase):
         requests = [call for call in self.client.calls if call[0] == "request"]
         self.assertEqual(len(requests), 3)
         self.assertTrue(all(call[1] == "GET" for call in requests))
+
+    def test_media_server_detection_uses_public_read_only_probes(self):
+        snapshot = self.reconciler.select_and_detect(
+            ["prowlarr", "sonarr", "jellyfin", "plex"], "direct",
+        )
+        self.assertTrue(snapshot["canConfirm"])
+        requested = {call[2] for call in self.client.calls if call[0] == "request"}
+        self.assertIn("http://jellyfin:8096/System/Info/Public", requested)
+        self.assertIn("http://plex:32400/identity", requested)
+
+    def test_jellyfin_reconciliation_creates_only_named_owned_libraries(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_ENABLED_SERVICES"] = "prowlarr,sonarr,radarr,jellyfin"
+        client = MediaServerClient()
+        reconciler = Reconciler(Settings(values), client)
+
+        first = reconciler.configure_jellyfin()
+        second = reconciler.configure_jellyfin()
+
+        self.assertIn("2 managed libraries", first)
+        self.assertIn("0 created, 0 paths added", second)
+        self.assertEqual(
+            {item["Name"] for item in client.jellyfin_folders},
+            {"Personal Movies", "Umbrel Arr TV", "Umbrel Arr Movies"},
+        )
+        mutations = [
+            call for call in client.calls
+            if call[0] == "json" and call[1] == "POST" and "/Library/VirtualFolders" in call[2]
+        ]
+        self.assertEqual(len(mutations), 4)
+        self.assertTrue(all(call[5] == {"X-Emby-Token": "jellyfin-key"} for call in mutations))
+
+    def test_plex_reconciliation_creates_only_named_owned_libraries(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_ENABLED_SERVICES"] = "prowlarr,sonarr,radarr,plex"
+        client = MediaServerClient()
+        reconciler = Reconciler(Settings(values), client)
+
+        first = reconciler.configure_plex()
+        second = reconciler.configure_plex()
+
+        self.assertIn("2 managed libraries", first)
+        self.assertIn("0 created", second)
+        self.assertEqual(
+            {item["title"] for item in client.plex_sections},
+            {"Personal Movies", "Umbrel Arr TV", "Umbrel Arr Movies"},
+        )
+        creates = [
+            call for call in client.calls
+            if call[0] == "json" and call[1] == "POST" and "/library/sections?" in call[2]
+        ]
+        self.assertEqual(len(creates), 2)
+        self.assertTrue(all(call[5] == {"X-Plex-Token": "plex-key"} for call in creates))
+
+    def test_plex_does_not_overwrite_a_named_library_with_a_different_path(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_ENABLED_SERVICES"] = "prowlarr,radarr,plex"
+        client = MediaServerClient()
+        client.plex_sections.append({
+            "key": "91", "title": "Umbrel Arr Movies", "Location": [{"path": "/elsewhere"}],
+        })
+        reconciler = Reconciler(Settings(values), client)
+
+        status, detail = reconciler.configure_plex()
+
+        self.assertEqual(status, "action_required")
+        self.assertIn("Umbrel Arr Movies", detail)
+        self.assertFalse(any(call[1] in {"PUT", "DELETE"} for call in client.calls))
 
     def test_modular_selection_and_provider_restore_from_api_markers(self):
         client = FakeClient()
@@ -879,6 +996,7 @@ class StateTests(unittest.TestCase):
 
     def test_storage_is_derived_from_api_root_ids_without_files(self):
         storage = StorageSettings()
+        storage.set_enabled_modules({*LOCAL_ROOTS, "jellyfin", "plex"})
         folders = {
             slug: [{"id": index + 10, "path": path}]
             for index, (slug, path) in enumerate(NETWORK_ROOTS.items())
@@ -889,6 +1007,8 @@ class StateTests(unittest.TestCase):
         self.assertFalse(snapshot["actionRequired"])
         self.assertEqual(len(snapshot["libraries"]), 5)
         self.assertIn("overseerr", LIBRARY_DEFINITIONS["radarr-4k"]["apps"])
+        self.assertIn("jellyfin", snapshot["libraries"][0]["apps"])
+        self.assertIn("plex", snapshot["libraries"][0]["apps"])
 
     def test_multiple_existing_roots_require_an_explicit_api_selection(self):
         storage = StorageSettings()
@@ -927,14 +1047,32 @@ class ApiKeyResolverTests(unittest.TestCase):
         self.write("sabnzbd/sabnzbd.ini", "__encoding__ = utf-8\n[misc]\napi_key = sabnzbd-generated-key-123456\n")
         self.write("bazarr/config/config.yaml", "auth:\n  apikey: bazarr-generated-key-123456\ngeneral:\n  flask_secret_key: ignored\n")
         self.write("overseerr/settings.json", json.dumps({"main": {"apiKey": "overseerr-generated-key-123456"}}))
+        jellyfin_db = self.root / "jellyfin/data/jellyfin.db"
+        jellyfin_db.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(jellyfin_db) as connection:
+            connection.execute('CREATE TABLE "ApiKeys" ("Name" TEXT, "AccessToken" TEXT)')
+            connection.execute(
+                'INSERT INTO "ApiKeys" ("Name", "AccessToken") VALUES (?, ?)',
+                ("another-app", "do-not-adopt-this-key"),
+            )
+            connection.execute(
+                'INSERT INTO "ApiKeys" ("Name", "AccessToken") VALUES (?, ?)',
+                ("umbrelarr", "jellyfin-generated-key-123456"),
+            )
+        self.write(
+            "plex/Library/Application Support/Plex Media Server/Preferences.xml",
+            '<Preferences FriendlyName="Umbrel" PlexOnlineToken="plex-generated-token-123456"/>',
+        )
 
         expected = {
             "prowlarr", "sonarr", "sonarr-4k", "radarr", "radarr-4k", "lidarr",
-            "sabnzbd", "bazarr", "overseerr",
+            "sabnzbd", "bazarr", "overseerr", "jellyfin", "plex",
         }
         self.assertEqual({slug for slug in expected if self.resolver.resolve(slug)}, expected)
         self.assertEqual(self.resolver.resolve("bazarr"), "bazarr-generated-key-123456")
         self.assertEqual(self.resolver.resolve("overseerr"), "overseerr-generated-key-123456")
+        self.assertEqual(self.resolver.resolve("jellyfin"), "jellyfin-generated-key-123456")
+        self.assertEqual(self.resolver.resolve("plex"), "plex-generated-token-123456")
 
     def test_missing_malformed_and_unsupported_sources_are_safe(self):
         self.write("sonarr/config.xml", "<Config><ApiKey>")

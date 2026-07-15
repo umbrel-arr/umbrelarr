@@ -48,6 +48,10 @@ SERVICE_MODULES = (
     ServiceModule("bazarr", "Bazarr", 30989, "subtitle_manager", True),
     ServiceModule("overseerr", "Overseerr", 30990, "request_manager", True),
     ServiceModule("profilarr", "Profilarr", 30991, "profile_manager"),
+    # Media servers are user-installed official Umbrel apps. Umbrelarr only
+    # discovers and configures them when they are explicitly selected.
+    ServiceModule("jellyfin", "Jellyfin", 8096, "media_server", True, default_enabled=False),
+    ServiceModule("plex", "Plex", 32400, "media_server", True, default_enabled=False),
 )
 
 MODULES = {module.id: module for module in SERVICE_MODULES}
@@ -55,6 +59,7 @@ CORE_MODULES = frozenset(module.id for module in SERVICE_MODULES if module.requi
 DEFAULT_MODULES = frozenset(module.id for module in SERVICE_MODULES if module.default_enabled)
 MEDIA_MODULES = tuple(module.id for module in SERVICE_MODULES if module.role == "media_manager")
 VIDEO_MODULES = tuple(slug for slug in MEDIA_MODULES if slug != "lidarr")
+MEDIA_SERVER_MODULES = tuple(module.id for module in SERVICE_MODULES if module.role == "media_server")
 
 STACK_PROFILES = (
     StackProfile(
@@ -77,8 +82,18 @@ STACK_PROFILES = (
         "Every supported download, media, subtitle, request, and profile module.",
         tuple(
             module.id for module in SERVICE_MODULES
-            if module.role not in {"control_plane", "vpn_provider"}
+            if module.default_enabled and module.role not in {"control_plane", "vpn_provider"}
         ),
+    ),
+    StackProfile(
+        "jellyfin-video", "Jellyfin video stack",
+        "Prowlarr, qBittorrent, Sonarr, Radarr, and an existing Jellyfin server.",
+        ("prowlarr", "qbittorrent", "sonarr", "radarr", "jellyfin"),
+    ),
+    StackProfile(
+        "plex-video", "Plex video stack",
+        "Prowlarr, qBittorrent, Sonarr, Radarr, and an existing Plex server.",
+        ("prowlarr", "qbittorrent", "sonarr", "radarr", "plex"),
     ),
 )
 
@@ -113,6 +128,9 @@ def dependencies_for(enabled, vpn_service_id=None):
         dependencies["profilarr"] = video
     if "overseerr" in enabled:
         dependencies["overseerr"] = video
+    for slug in MEDIA_SERVER_MODULES:
+        if slug in enabled:
+            dependencies[slug] = ("umbrelarr", *media)
     return dependencies
 
 
@@ -125,4 +143,7 @@ def validate_modules(enabled):
         errors.append("Profilarr requires at least one Sonarr or Radarr module")
     if "overseerr" in enabled and not any(slug in enabled for slug in VIDEO_MODULES):
         errors.append("Overseerr requires at least one Sonarr or Radarr module")
+    for slug in MEDIA_SERVER_MODULES:
+        if slug in enabled and not any(module in enabled for module in MEDIA_MODULES):
+            errors.append(f"{MODULES[slug].name} requires at least one Sonarr, Radarr, or Lidarr module")
     return errors

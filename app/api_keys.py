@@ -1,5 +1,6 @@
 import json
 import re
+import sqlite3
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -14,6 +15,8 @@ SOURCES = {
     "sabnzbd": ("ini", "sabnzbd/sabnzbd.ini"),
     "bazarr": ("yaml", "bazarr/config/config.yaml"),
     "overseerr": ("json", "overseerr/settings.json"),
+    "jellyfin": ("jellyfin", "jellyfin/data/jellyfin.db"),
+    "plex": ("plex", "plex/Library/Application Support/Plex Media Server/Preferences.xml"),
 }
 
 
@@ -31,7 +34,7 @@ class ApiKeyResolver:
         path = self.root / relative_path
         try:
             value = getattr(self, f"_{kind}")(path)
-        except (OSError, ValueError, ElementTree.ParseError, json.JSONDecodeError):
+        except (OSError, ValueError, sqlite3.Error, ElementTree.ParseError, json.JSONDecodeError):
             return ""
         return self._clean(value)
 
@@ -94,3 +97,23 @@ class ApiKeyResolver:
         data = json.loads(path.read_text(encoding="utf-8"))
         main = data.get("main", {}) if isinstance(data, dict) else {}
         return main.get("apiKey", "") if isinstance(main, dict) else ""
+
+    @staticmethod
+    def _jellyfin(path):
+        # Jellyfin 10.11 stores API keys in its main SQLite database. Read only
+        # the key explicitly named for umbrelarr; unrelated user keys are never
+        # adopted. URI read-only mode prevents accidental database writes.
+        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+        try:
+            row = connection.execute(
+                'SELECT "AccessToken" FROM "ApiKeys" WHERE lower("Name") = ? LIMIT 1',
+                ("umbrelarr",),
+            ).fetchone()
+            return row[0] if row else ""
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _plex(path):
+        root = ElementTree.parse(path).getroot()
+        return root.attrib.get("PlexOnlineToken", "")

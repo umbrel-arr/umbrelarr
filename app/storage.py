@@ -25,35 +25,35 @@ LIBRARY_DEFINITIONS = {
         "name": "TV",
         "variant": "HD",
         "category": "tv",
-        "apps": ["sonarr", "qbittorrent", "sabnzbd", "prowlarr", "bazarr", "profilarr", "overseerr"],
+        "apps": ["sonarr", "qbittorrent", "sabnzbd", "prowlarr", "bazarr", "profilarr", "overseerr", "jellyfin", "plex"],
     },
     "sonarr-4k": {
         "id": "tv-4k",
         "name": "TV",
         "variant": "4K",
         "category": "tv-4k",
-        "apps": ["sonarr-4k", "qbittorrent", "sabnzbd", "prowlarr", "profilarr", "overseerr"],
+        "apps": ["sonarr-4k", "qbittorrent", "sabnzbd", "prowlarr", "profilarr", "overseerr", "jellyfin", "plex"],
     },
     "radarr": {
         "id": "movies",
         "name": "Movies",
         "variant": "HD",
         "category": "movies",
-        "apps": ["radarr", "qbittorrent", "sabnzbd", "prowlarr", "bazarr", "profilarr", "overseerr"],
+        "apps": ["radarr", "qbittorrent", "sabnzbd", "prowlarr", "bazarr", "profilarr", "overseerr", "jellyfin", "plex"],
     },
     "radarr-4k": {
         "id": "movies-4k",
         "name": "Movies",
         "variant": "4K",
         "category": "movies-4k",
-        "apps": ["radarr-4k", "qbittorrent", "sabnzbd", "prowlarr", "profilarr", "overseerr"],
+        "apps": ["radarr-4k", "qbittorrent", "sabnzbd", "prowlarr", "profilarr", "overseerr", "jellyfin", "plex"],
     },
     "lidarr": {
         "id": "music",
         "name": "Music",
         "variant": "Standard",
         "category": "music",
-        "apps": ["lidarr", "qbittorrent", "sabnzbd", "prowlarr"],
+        "apps": ["lidarr", "qbittorrent", "sabnzbd", "prowlarr", "jellyfin", "plex"],
     },
 }
 
@@ -79,7 +79,7 @@ class StorageSettings:
 
     def set_enabled_modules(self, enabled):
         with self._lock:
-            self.enabled_modules = set(enabled) & set(LIBRARY_DEFINITIONS)
+            self.enabled_modules = set(enabled)
 
     def root(self, slug):
         with self._lock:

@@ -7,11 +7,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from api_keys import ApiKeyResolver
 from catalog import (
-    DEFAULT_MODULES, MEDIA_MODULES, MODULES, SERVICE_MODULES, STACK_PROFILES, VIDEO_MODULES,
+    DEFAULT_MODULES, MEDIA_MODULES, MEDIA_SERVER_MODULES, MODULES, SERVICE_MODULES,
+    STACK_PROFILES, VIDEO_MODULES,
     dependencies_for, normalize_modules, validate_modules,
 )
 from http_client import HttpClient, RequestError
@@ -32,6 +33,14 @@ DATABASE_URL = "https://github.com/Dictionarry-Hub/database"
 HD_PROFILES = ["1080p Compact", "1080p Efficient", "1080p Quality HDR"]
 UHD_PROFILES = ["2160p Efficient", "2160p Quality"]
 
+MEDIA_LIBRARY_CONFIG = {
+    "sonarr": {"name": "Umbrel Arr TV", "jellyfinType": "tvshows", "plexType": 2, "plexScanner": "Plex TV Series", "plexAgent": "tv.plex.agents.series"},
+    "sonarr-4k": {"name": "Umbrel Arr TV 4K", "jellyfinType": "tvshows", "plexType": 2, "plexScanner": "Plex TV Series", "plexAgent": "tv.plex.agents.series"},
+    "radarr": {"name": "Umbrel Arr Movies", "jellyfinType": "movies", "plexType": 1, "plexScanner": "Plex Movie", "plexAgent": "tv.plex.agents.movie"},
+    "radarr-4k": {"name": "Umbrel Arr Movies 4K", "jellyfinType": "movies", "plexType": 1, "plexScanner": "Plex Movie", "plexAgent": "tv.plex.agents.movie"},
+    "lidarr": {"name": "Umbrel Arr Music", "jellyfinType": "music", "plexType": 8, "plexScanner": "Plex Music", "plexAgent": "tv.plex.agents.music"},
+}
+
 
 APP_PORTS = {module.id: module.port for module in SERVICE_MODULES}
 NAMES = {module.id: module.name for module in SERVICE_MODULES}
@@ -39,7 +48,9 @@ MEDIA_APPS = MEDIA_MODULES
 HD_UHD_VIDEO_APPS = VIDEO_MODULES
 # Compatibility exports describe the default 1.1 stack. Runtime requirements
 # are derived from the user's selected modules instead.
-REQUIRED_APPS = tuple(slug for slug in NAMES if slug != "umbrelarr")
+REQUIRED_APPS = tuple(
+    slug for slug in NAMES if slug != "umbrelarr" and slug in DEFAULT_MODULES
+)
 KEYED_APPS = {module.id for module in SERVICE_MODULES if module.requires_api_key}
 DEPENDENCIES = dependencies_for(DEFAULT_MODULES, "privado-vpn")
 
@@ -185,9 +196,11 @@ class Reconciler:
                 download_results["sabnzbd"] = self._step("sabnzbd", self.configure_sabnzbd, vpn_ok)
             downloads_ok = all(download_results.values())
             if storage_ok and downloads_ok:
+                media_results = {}
                 for arr in self.arrs:
-                    self._step(arr.slug, self.configure_arr, arr)
+                    media_results[arr.slug] = self._step(arr.slug, self.configure_arr, arr)
             else:
+                media_results = {arr.slug: False for arr in self.arrs}
                 detail = "Waiting for library storage" if not storage_ok else "Waiting for selected download clients"
                 for arr in self.arrs:
                     self.runtime.set(arr.slug, "waiting", detail)
@@ -204,6 +217,14 @@ class Reconciler:
                 self._step("profilarr", self.configure_profilarr)
             if "overseerr" in self.enabled_modules:
                 self._step("overseerr", self.configure_overseerr)
+            media_ready = bool(media_results) and all(media_results.values())
+            for slug, callback in (("jellyfin", self.configure_jellyfin), ("plex", self.configure_plex)):
+                if slug not in self.enabled_modules:
+                    continue
+                if media_ready:
+                    self._step(slug, callback)
+                else:
+                    self.runtime.set(slug, "waiting", "Waiting for selected media managers and library storage")
             self.runtime.event("Reconciliation completed")
         finally:
             self.runtime.complete()
@@ -397,7 +418,12 @@ class Reconciler:
         detail = "No configured service address"
         if url:
             try:
-                probe = f"{url}/api/v2/app/version" if slug == "qbittorrent" else f"{url}/"
+                probes = {
+                    "qbittorrent": "/api/v2/app/version",
+                    "jellyfin": "/System/Info/Public",
+                    "plex": "/identity",
+                }
+                probe = f"{url}{probes.get(slug, '/')}"
                 self.client.request("GET", probe, timeout=3)
                 reachable = True
                 probe_succeeded = True
@@ -418,15 +444,25 @@ class Reconciler:
         else:
             credentials = slug not in KEYED_APPS or bool(self.settings.key(slug))
         if reachable and not credentials and slug != "qbittorrent":
-            detail = (
-                "Installed app found; waiting for its API key. Restart umbrelarr "
-                "if this app was installed after umbrelarr started"
-            )
+            if slug == "jellyfin":
+                detail = "Create a Jellyfin API key named umbrelarr, then restart umbrelarr"
+            elif slug == "plex":
+                detail = "Claim or sign in to this Plex server, then restart umbrelarr"
+            else:
+                detail = (
+                    "Installed app found; waiting for its API key. Restart umbrelarr "
+                    "if this app was installed after umbrelarr started"
+                )
         action = "none"
         if not reachable:
             action = "install_or_start"
         elif not credentials:
-            action = "temporary_password_required" if slug == "qbittorrent" else "wait_for_api_key"
+            actions = {
+                "qbittorrent": "temporary_password_required",
+                "jellyfin": "create_api_key",
+                "plex": "claim_server",
+            }
+            action = actions.get(slug, "wait_for_api_key")
         return {
             "id": slug,
             "name": NAMES[slug],
@@ -1112,6 +1148,99 @@ class Reconciler:
                 prowlarr_key, {"label": PROFILARR_SYNC_MARKER_TAG},
             )
         return f"Dictionarry profiles and referenced custom formats sync daily to {len(video_arrs)} Arr instances"
+
+    def _selected_media_libraries(self):
+        return [
+            (arr, MEDIA_LIBRARY_CONFIG[arr.slug])
+            for arr in self.arrs if arr.slug in MEDIA_LIBRARY_CONFIG
+        ]
+
+    def configure_jellyfin(self):
+        url = self.settings.url("jellyfin")
+        key = self.settings.key("jellyfin")
+        if not key:
+            return "action_required", "Create a Jellyfin API key named umbrelarr, then restart umbrelarr"
+        headers = {"X-Emby-Token": key}
+        folders = self.client.json("GET", f"{url}/Library/VirtualFolders", headers=headers) or []
+        existing = {
+            str(folder.get("Name", "")): folder
+            for folder in folders if isinstance(folder, dict)
+        }
+        created = 0
+        paths_added = 0
+        for arr, config in self._selected_media_libraries():
+            name = config["name"]
+            folder = existing.get(name)
+            locations = {
+                str(path).rstrip("/")
+                for path in (folder or {}).get("Locations", []) if path
+            }
+            if folder is None:
+                query = urlencode({
+                    "name": name,
+                    "collectionType": config["jellyfinType"],
+                    "refreshLibrary": "false",
+                })
+                self.client.json(
+                    "POST", f"{url}/Library/VirtualFolders?{query}",
+                    payload={"LibraryOptions": {}}, headers=headers,
+                )
+                created += 1
+            if arr.root.rstrip("/") not in locations:
+                self.client.json(
+                    "POST", f"{url}/Library/VirtualFolders/Paths?refreshLibrary=false",
+                    payload={"Name": name, "Path": arr.root}, headers=headers,
+                )
+                paths_added += 1
+        return f"{len(self.arrs)} managed libraries are current ({created} created, {paths_added} paths added)"
+
+    def configure_plex(self):
+        url = self.settings.url("plex")
+        token = self.settings.key("plex")
+        if not token:
+            return "action_required", "Claim or sign in to this Plex server, then restart umbrelarr"
+        headers = {"X-Plex-Token": token}
+        response = self.client.json("GET", f"{url}/library/sections", headers=headers) or {}
+        container = response.get("MediaContainer", {}) if isinstance(response, dict) else {}
+        directories = container.get("Directory", []) if isinstance(container, dict) else []
+        if isinstance(directories, dict):
+            directories = [directories]
+        existing = {
+            str(directory.get("title", "")): directory
+            for directory in directories if isinstance(directory, dict)
+        }
+        created = 0
+        conflicts = []
+        for arr, config in self._selected_media_libraries():
+            name = config["name"]
+            section = existing.get(name)
+            locations = (section or {}).get("Location", [])
+            if isinstance(locations, dict):
+                locations = [locations]
+            paths = {
+                str(location.get("path", "")).rstrip("/")
+                for location in locations if isinstance(location, dict)
+            }
+            if section is not None:
+                if arr.root.rstrip("/") not in paths:
+                    conflicts.append(name)
+                continue
+            query = urlencode({
+                "name": name,
+                "type": config["plexType"],
+                "scanner": config["plexScanner"],
+                "agent": config["plexAgent"],
+                "language": "en-US",
+                "locations": [arr.root],
+            }, doseq=True)
+            self.client.json("POST", f"{url}/library/sections?{query}", headers=headers)
+            created += 1
+        if conflicts:
+            return (
+                "action_required",
+                "These Umbrel Arr Plex libraries use a different path: " + ", ".join(conflicts),
+            )
+        return f"{len(self.arrs)} managed libraries are current ({created} created)"
 
     def configure_overseerr(self):
         url = self.settings.url("overseerr")

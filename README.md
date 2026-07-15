@@ -23,10 +23,12 @@ modules instead of a fixed stack. Prowlarr and umbrelarr are the small required
 core because Prowlarr tags are the API-owned persistence layer for consent,
 module selection, VPN provider choice, and library layout.
 
-The setup screen provides core-only, TV/torrent, video/Usenet, and complete
-starting profiles. Profiles are shortcuts over the same module catalog, so the
-operator can still adjust every service independently and choose VPN routing
-separately.
+The setup screen provides core-only, TV/torrent, video/Usenet, complete
+automation, Jellyfin video, and Plex video starting profiles. Jellyfin and Plex
+are opt-in modules that connect to the official apps the operator already
+installed; neither is silently added to an existing stack. Profiles are
+shortcuts over the same module catalog, so the operator can still adjust every
+service independently and choose VPN routing separately.
 
 VPN routing is provided through adapters in `app/vpn.py`. The built-in choices
 are:
@@ -61,6 +63,12 @@ umbrelarr once so Umbrel can refresh the read-only credential mounts, then run
 detection again. The dashboard calls this out when an installed app is reachable
 but its API key handoff is not yet mounted.
 
+Jellyfin requires an API key named `umbrelarr`; umbrelarr deliberately ignores
+every other Jellyfin API key. Plex must already be claimed or signed in. The
+official apps' config directories are mounted read-only so umbrelarr can obtain
+that one named key or the existing Plex token, while all library changes go
+through the corresponding media-server API.
+
 Consent, storage selection, and the Profilarr initial-sync marker are restored
 from umbrelarr-owned Prowlarr tags. API keys may be read from app-generated
 configuration mounted read-only at `/managed-config`; they are never copied,
@@ -89,9 +97,12 @@ umbrelarr continuously reconciles only these declared resources:
 | Prowlarr | Selected proxy fields, selected Arr applications, FlareSolverr integration, and Umbrel Arr state tags |
 | Bazarr | Selected Sonarr/Radarr connections and provider proxy fields |
 | Profilarr / Overseerr | Stable Umbrel Arr server registrations and initial synchronization |
+| Jellyfin / Plex | Stable `Umbrel Arr …` libraries and their selected Arr root paths |
 
-Unrelated indexers, providers, categories, roots, profiles, servers, and user
-preferences are preserved.
+Unrelated media libraries, indexers, providers, categories, roots, profiles,
+servers, and user preferences are preserved. A Plex library that already uses
+an `Umbrel Arr …` name with a different path is reported for explicit action
+instead of being overwritten.
 
 ## Development
 

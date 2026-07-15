@@ -235,6 +235,42 @@ test('detects only the selected service modules and VPN provider', async ({ page
   await expectNoDocumentOverflow(page);
 });
 
+test('renders Jellyfin and Plex as opt-in modules with actionable credential states', async ({ page }) => {
+  const modular = modularSetup();
+  const setup = {
+    ...modular,
+    enabledServices: [...modular.enabledServices, 'jellyfin', 'plex'],
+    modules: [
+      ...modular.modules,
+      { id: 'jellyfin', name: 'Jellyfin', role: 'media_server', enabled: true, required: false },
+      { id: 'plex', name: 'Plex', role: 'media_server', enabled: true, required: false },
+    ],
+    apps: [
+      {
+        id: 'jellyfin', name: 'Jellyfin', reachable: true, credentials: false,
+        action: 'create_api_key', detail: 'Create a Jellyfin API key named umbrelarr',
+        link: 'http://umbrel.local:8096',
+      },
+      {
+        id: 'plex', name: 'Plex', reachable: true, credentials: false,
+        action: 'claim_server', detail: 'Claim or sign in to this Plex server',
+        link: 'http://umbrel.local:32400',
+      },
+    ],
+  };
+  await page.route('**/api/status', route => route.fulfill({ json: statusFixture() }));
+  await page.route('**/api/setup', route => route.fulfill({ json: setup }));
+  await page.route('**/api/storage', route => route.fulfill({ json: storageFixture() }));
+
+  await page.goto('/setup');
+
+  await expect(page.locator('[data-module][value="jellyfin"]')).toBeChecked();
+  await expect(page.locator('[data-module][value="plex"]')).toBeChecked();
+  await expect(page.locator('#setupApps')).toContainText('Create API key');
+  await expect(page.locator('#setupApps')).toContainText('Claim server');
+  await expectNoDocumentOverflow(page);
+});
+
 test('applies a starting profile without coupling it to the VPN provider', async ({ page }) => {
   const setup = modularSetup();
   await page.route('**/api/status', route => route.fulfill({ json: statusFixture() }));
