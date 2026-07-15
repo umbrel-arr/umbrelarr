@@ -85,6 +85,19 @@ class Handler(BaseHTTPRequestHandler):
                 started = RECONCILER.reconcile_async()
                 return self.send_json(202 if started else 200, {"started": started})
             if path == "/api/setup/detect":
+                values = self._form()
+                raw_services = values.get("enabledServices", [""])[0]
+                if raw_services:
+                    try:
+                        enabled_services = json.loads(raw_services)
+                    except json.JSONDecodeError as error:
+                        raise ValueError("enabledServices must be a JSON array") from error
+                    if not isinstance(enabled_services, list):
+                        raise ValueError("enabledServices must be a JSON array")
+                    return self.send_json(200, RECONCILER.select_and_detect(
+                        enabled_services,
+                        values.get("vpnProvider", [""])[0],
+                    ))
                 return self.send_json(200, RECONCILER.detect_apps())
             if path == "/api/setup/confirm":
                 values = self._form()
@@ -94,11 +107,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError("rootIds must be a JSON object") from error
                 if not isinstance(root_ids, dict):
                     raise ValueError("rootIds must be a JSON object")
+                try:
+                    enabled_services = json.loads(values.get("enabledServices", ["null"])[0] or "null")
+                except json.JSONDecodeError as error:
+                    raise ValueError("enabledServices must be a JSON array") from error
+                if enabled_services is not None and not isinstance(enabled_services, list):
+                    raise ValueError("enabledServices must be a JSON array")
                 return self.send_json(202, RECONCILER.confirm_setup(
                     values.get("storageMode", [""])[0],
                     root_ids,
                     values.get("qbittorrentUsername", ["admin"])[0],
                     values.get("qbittorrentTemporaryPassword", [""])[0],
+                    enabled_services,
+                    values.get("vpnProvider", [""])[0],
                 ))
             if path == "/api/vpn/login":
                 self._require_setup()

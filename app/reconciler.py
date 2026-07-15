@@ -10,9 +10,14 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from api_keys import ApiKeyResolver
+from catalog import (
+    DEFAULT_MODULES, MEDIA_MODULES, MODULES, SERVICE_MODULES, STACK_PROFILES, VIDEO_MODULES,
+    dependencies_for, normalize_modules, validate_modules,
+)
 from http_client import HttpClient, RequestError
 from state import RuntimeState, ServiceStatus
 from storage import LOCAL_ROOTS, PRESETS, StorageSettings
+from vpn import VPN_PROVIDERS, get_vpn_provider
 
 
 MANAGED_TAG = "umbrel-arr-managed"
@@ -20,69 +25,23 @@ SETUP_MARKER_TAG = "umbrel-arr-setup-complete"
 SETUP_READY_MARKER_TAG = "umbrel-arr-setup-ready-v1"
 PROFILARR_SYNC_MARKER_TAG = "umbrel-arr-profilarr-initial-sync-v1"
 STORAGE_MARKER_PREFIX = "umbrel-arr-storage-"
+MODULE_CATALOG_MARKER_TAG = "umbrel-arr-modular-selection-v1"
+MODULE_MARKER_PREFIX = "umbrel-arr-module-"
+VPN_PROVIDER_MARKER_PREFIX = "umbrel-arr-vpn-provider-"
 DATABASE_URL = "https://github.com/Dictionarry-Hub/database"
 HD_PROFILES = ["1080p Compact", "1080p Efficient", "1080p Quality HDR"]
 UHD_PROFILES = ["2160p Efficient", "2160p Quality"]
 
 
-APP_PORTS = {
-    "privado-vpn": 30980,
-    "flaresolverr": 30981,
-    "prowlarr": 30982,
-    "qbittorrent": 30983,
-    "sabnzbd": 30984,
-    "sonarr": 30985,
-    "sonarr-4k": 30986,
-    "radarr": 30987,
-    "radarr-4k": 30988,
-    "bazarr": 30989,
-    "overseerr": 30990,
-    "profilarr": 30991,
-    "umbrelarr": 30992,
-    "lidarr": 30993,
-}
-
-
-NAMES = {
-    "privado-vpn": "Privado VPN",
-    "flaresolverr": "FlareSolverr",
-    "prowlarr": "Prowlarr",
-    "qbittorrent": "qBittorrent",
-    "sabnzbd": "SABnzbd",
-    "sonarr": "Sonarr",
-    "sonarr-4k": "Sonarr 4K",
-    "radarr": "Radarr",
-    "radarr-4k": "Radarr 4K",
-    "bazarr": "Bazarr",
-    "overseerr": "Overseerr",
-    "profilarr": "Profilarr",
-    "umbrelarr": "umbrelarr",
-    "lidarr": "Lidarr",
-}
-
-
-MEDIA_APPS = ("sonarr", "sonarr-4k", "radarr", "radarr-4k", "lidarr")
-HD_UHD_VIDEO_APPS = ("sonarr", "sonarr-4k", "radarr", "radarr-4k")
+APP_PORTS = {module.id: module.port for module in SERVICE_MODULES}
+NAMES = {module.id: module.name for module in SERVICE_MODULES}
+MEDIA_APPS = MEDIA_MODULES
+HD_UHD_VIDEO_APPS = VIDEO_MODULES
+# Compatibility exports describe the default 1.1 stack. Runtime requirements
+# are derived from the user's selected modules instead.
 REQUIRED_APPS = tuple(slug for slug in NAMES if slug != "umbrelarr")
-KEYED_APPS = {
-    "prowlarr", "sabnzbd", "sonarr", "sonarr-4k", "radarr", "radarr-4k",
-    "bazarr", "overseerr", "lidarr",
-}
-DEPENDENCIES = {
-    "umbrelarr": (),
-    "privado-vpn": (),
-    "flaresolverr": ("privado-vpn",),
-    "qbittorrent": ("privado-vpn",),
-    "sabnzbd": ("privado-vpn",),
-    **{
-        slug: ("umbrelarr", "qbittorrent", "sabnzbd")
-        for slug in MEDIA_APPS
-    },
-    "prowlarr": ("privado-vpn", "flaresolverr", *MEDIA_APPS),
-    "bazarr": ("privado-vpn", "sonarr", "radarr"),
-    "profilarr": HD_UHD_VIDEO_APPS,
-    "overseerr": HD_UHD_VIDEO_APPS,
-}
+KEYED_APPS = {module.id for module in SERVICE_MODULES if module.requires_api_key}
+DEPENDENCIES = dependencies_for(DEFAULT_MODULES, "privado-vpn")
 
 
 @dataclass
@@ -110,6 +69,11 @@ class Settings:
         self.device_domain = env.get("DEVICE_DOMAIN_NAME", "umbrel.local")
         self.interval = max(30, int(env.get("RECONCILE_INTERVAL", "300")))
         self.api_keys = ApiKeyResolver(env.get("UMBREL_ARR_MANAGED_CONFIG_DIR", "/managed-config"))
+        configured_modules = env.get("UMBREL_ARR_ENABLED_SERVICES", "")
+        self.enabled_modules = normalize_modules(
+            configured_modules.split(",") if configured_modules.strip() else DEFAULT_MODULES
+        )
+        self.vpn_provider_id = env.get("UMBREL_ARR_VPN_PROVIDER", "privado").strip() or "privado"
 
     def url(self, slug):
         key = f"UMBREL_ARR_{slug.upper().replace('-', '_')}_URL"
@@ -121,7 +85,8 @@ class Settings:
         return exported or self.api_keys.resolve(slug)
 
     def external_url(self, slug):
-        return f"http://{self.device_domain}:{APP_PORTS[slug]}"
+        port = APP_PORTS.get(slug)
+        return f"http://{self.device_domain}:{port}" if port else ""
 
     @property
     def qbittorrent_password(self):
@@ -132,19 +97,39 @@ class Reconciler:
     def __init__(self, settings=None, client=None):
         self.settings = settings or Settings()
         self.client = client or HttpClient()
-        services = [
-            ServiceStatus(slug, NAMES[slug], link=self.settings.external_url(slug))
-            for slug in NAMES
-        ]
-        self.runtime = RuntimeState(services, DEPENDENCIES)
         self.storage = StorageSettings()
-        self.arrs = self._arr_instances()
         self._setup_lock = threading.RLock()
         self._setup_complete = False
         self._setup_ready = False
+        self._selection_dirty = False
         self._setup_detection = []
         self._qbittorrent_cookie = ""
+        self.enabled_modules = frozenset()
+        self.vpn_provider = get_vpn_provider(self.settings.vpn_provider_id)
+        self._set_modules(self.settings.enabled_modules, self.vpn_provider.id)
         self._mark_setup_required()
+
+    def _set_modules(self, enabled, vpn_provider_id):
+        provider = get_vpn_provider(vpn_provider_id)
+        selected = set(normalize_modules(enabled))
+        selected.discard("privado-vpn")
+        if provider.service_id:
+            selected.add(provider.service_id)
+        self.enabled_modules = normalize_modules(selected)
+        self.vpn_provider = provider
+        self.storage.set_enabled_modules(self.enabled_modules)
+        dependencies = dependencies_for(self.enabled_modules, provider.service_id)
+        previous_events = list(getattr(getattr(self, "runtime", None), "events", []))
+        services = [
+            ServiceStatus(slug, NAMES[slug], link=self.settings.external_url(slug))
+            for slug in NAMES if slug in self.enabled_modules
+        ]
+        self.runtime = RuntimeState(services, dependencies)
+        self.runtime.events = previous_events
+        self.arrs = [arr for arr in self._arr_instances() if arr.slug in self.enabled_modules]
+
+    def _selected_apps(self):
+        return tuple(slug for slug in NAMES if slug != "umbrelarr" and slug in self.enabled_modules)
 
     def _arr_instances(self):
         return [
@@ -169,44 +154,59 @@ class Reconciler:
             return
         if not self.runtime.begin():
             return
-        self.arrs = self._arr_instances()
+        self.arrs = [arr for arr in self._arr_instances() if arr.slug in self.enabled_modules]
         self.runtime.event("Reconciliation started")
         try:
             storage_ok = self._step("umbrelarr", self.configure_storage)
-            vpn_ok = self._step("privado-vpn", self.check_vpn)
-            if vpn_ok:
-                flaresolverr_ok = self._step("flaresolverr", self.check_flaresolverr)
+            if self.vpn_provider.service_id in self.enabled_modules:
+                vpn_ok = self._step(self.vpn_provider.service_id, self.check_vpn)
             else:
-                flaresolverr_ok = False
-                self.runtime.set("flaresolverr", "waiting", "Waiting for a healthy Privado tunnel")
-            qbittorrent_ok = self._step("qbittorrent", self.configure_qbittorrent, vpn_ok)
-            sabnzbd_ok = self._step("sabnzbd", self.configure_sabnzbd, vpn_ok)
-            if storage_ok and qbittorrent_ok and sabnzbd_ok:
+                try:
+                    vpn_status, vpn_detail = self.vpn_provider.check(self.settings, self.client)
+                except (RequestError, OSError, ValueError) as error:
+                    vpn_status, vpn_detail = "waiting", self._safe_error(error)
+                vpn_ok = vpn_status == "healthy"
+                if not vpn_ok:
+                    self.runtime.set("umbrelarr", vpn_status, vpn_detail)
+            flaresolverr_ok = "flaresolverr" not in self.enabled_modules
+            if "flaresolverr" in self.enabled_modules:
+                if vpn_ok:
+                    flaresolverr_ok = self._step("flaresolverr", self.check_flaresolverr)
+                else:
+                    self.runtime.set("flaresolverr", "waiting", f"Waiting for {self.vpn_provider.name}")
+            download_results = {}
+            if "qbittorrent" in self.enabled_modules:
+                download_results["qbittorrent"] = self._step("qbittorrent", self.configure_qbittorrent, vpn_ok)
+            if "sabnzbd" in self.enabled_modules:
+                download_results["sabnzbd"] = self._step("sabnzbd", self.configure_sabnzbd, vpn_ok)
+            downloads_ok = all(download_results.values())
+            if storage_ok and downloads_ok:
                 for arr in self.arrs:
                     self._step(arr.slug, self.configure_arr, arr)
-            elif not storage_ok:
-                for arr in self.arrs:
-                    self.runtime.set(arr.slug, "waiting", "Waiting for writable network media storage")
             else:
+                detail = "Waiting for library storage" if not storage_ok else "Waiting for selected download clients"
                 for arr in self.arrs:
-                    self.runtime.set(arr.slug, "waiting", "Waiting for Privado-routed download clients")
+                    self.runtime.set(arr.slug, "waiting", detail)
             if vpn_ok and flaresolverr_ok:
-                self._step("prowlarr", self.configure_prowlarr, True)
+                self._step("prowlarr", self.configure_prowlarr, vpn_ok)
             else:
-                self.runtime.set("prowlarr", "waiting", "Waiting for Privado and FlareSolverr")
-            if vpn_ok:
-                self._step("bazarr", self.configure_bazarr, True)
-            else:
-                self.runtime.set("bazarr", "waiting", "Waiting for a healthy Privado tunnel")
-            self._step("profilarr", self.configure_profilarr)
-            self._step("overseerr", self.configure_overseerr)
+                self.runtime.set("prowlarr", "waiting", f"Waiting for selected network modules ({self.vpn_provider.name})")
+            if "bazarr" in self.enabled_modules:
+                if vpn_ok:
+                    self._step("bazarr", self.configure_bazarr, vpn_ok)
+                else:
+                    self.runtime.set("bazarr", "waiting", f"Waiting for {self.vpn_provider.name}")
+            if "profilarr" in self.enabled_modules:
+                self._step("profilarr", self.configure_profilarr)
+            if "overseerr" in self.enabled_modules:
+                self._step("overseerr", self.configure_overseerr)
             self.runtime.event("Reconciliation completed")
         finally:
             self.runtime.complete()
 
     def _mark_setup_required(self):
         self.runtime.set("umbrelarr", "action_required", "Detect and connect the Umbrel Arr apps you installed")
-        for slug in REQUIRED_APPS:
+        for slug in self._selected_apps():
             self.runtime.set(slug, "unknown", "Waiting for explicit Umbrelarr setup")
 
     def ensure_setup(self):
@@ -225,6 +225,8 @@ class Reconciler:
             item.get("label", "").casefold() == SETUP_MARKER_TAG
             for item in tags or []
         )
+        if complete:
+            self._restore_module_selection(tags)
         with self._setup_lock:
             self._setup_complete = complete
         return complete
@@ -235,13 +237,17 @@ class Reconciler:
         with self._setup_lock:
             apps = [dict(item) for item in self._setup_detection]
         reachable = sum(item["reachable"] for item in apps)
-        detection_complete = len(apps) == len(REQUIRED_APPS)
+        selected_apps = self._selected_apps()
+        detection_complete = len(apps) == len(selected_apps)
         blocking = [
             item for item in apps
             if not item["reachable"] or (not item["credentials"] and item["id"] != "qbittorrent")
         ]
-        can_confirm = detection_complete and not blocking
-        if ready:
+        vpn_status = self._vpn_setup_status()
+        can_confirm = detection_complete and not blocking and vpn_status["ready"]
+        if ready and self._selection_dirty:
+            phase = "ready" if can_confirm else "action_required"
+        elif ready:
             phase = "confirmed"
         elif confirmed:
             phase = "action_required"
@@ -255,11 +261,35 @@ class Reconciler:
             "phase": phase,
             "confirmed": confirmed,
             "canConfirm": can_confirm,
-            "requiredCount": len(REQUIRED_APPS),
+            "requiredCount": len(selected_apps),
+            "selectedCount": len(selected_apps),
             "detectedCount": reachable,
             "detectionComplete": detection_complete,
             "apps": apps,
+            "enabledServices": list(self.enabled_modules),
+            "modules": [
+                {**module.public(), "enabled": module.id in self.enabled_modules}
+                for module in SERVICE_MODULES if module.id != "umbrelarr"
+            ],
+            "profiles": [profile.public() for profile in STACK_PROFILES],
+            "vpnProvider": self.vpn_provider.id,
+            "vpnProviders": [provider.public() for provider in VPN_PROVIDERS.values()],
+            "vpnStatus": vpn_status,
+            "configurationChanged": self._selection_dirty,
         }
+
+    def _vpn_setup_status(self):
+        if self.vpn_provider.service_id:
+            return {
+                "ready": True,
+                "status": "managed_app",
+                "detail": f"{self.vpn_provider.name} health and login are managed after connection",
+            }
+        try:
+            status, detail = self.vpn_provider.check(self.settings, self.client)
+        except (RequestError, OSError, ValueError) as error:
+            status, detail = "waiting", self._safe_error(error)
+        return {"ready": status == "healthy", "status": status, "detail": detail}
 
     def ensure_setup_ready(self):
         if not self.ensure_setup():
@@ -275,13 +305,86 @@ class Reconciler:
             self._setup_ready = ready
         return ready
 
+    def _restore_module_selection(self, tags):
+        labels = {
+            str(item.get("label", "")).casefold()
+            for item in tags or []
+        }
+        if MODULE_CATALOG_MARKER_TAG not in labels:
+            # Migration path for 1.1: absence of the modular marker means the
+            # complete legacy stack remains selected with Privado.
+            return
+        selected = {
+            label.removeprefix(MODULE_MARKER_PREFIX)
+            for label in labels if label.startswith(MODULE_MARKER_PREFIX)
+        }
+        provider_id = next(
+            (
+                label.removeprefix(VPN_PROVIDER_MARKER_PREFIX)
+                for label in labels if label.startswith(VPN_PROVIDER_MARKER_PREFIX)
+            ),
+            self.settings.vpn_provider_id,
+        )
+        try:
+            self._set_modules(selected, provider_id)
+            self._selection_dirty = False
+        except ValueError:
+            # Invalid or stale API markers never authorize a surprise module
+            # change. Keep the environment/default selection visible instead.
+            return
+
+    def _replace_module_markers(self, enabled, provider_id):
+        key = self.settings.key("prowlarr")
+        api = f"{self.settings.url('prowlarr')}/api/v1"
+        tags = self._prowlarr_tags()
+        desired = {
+            MODULE_CATALOG_MARKER_TAG,
+            f"{VPN_PROVIDER_MARKER_PREFIX}{provider_id}",
+            *(f"{MODULE_MARKER_PREFIX}{slug}" for slug in enabled),
+        }
+        existing = {
+            str(item.get("label", "")).casefold(): item
+            for item in tags
+        }
+        managed = lambda label: (
+            label == MODULE_CATALOG_MARKER_TAG
+            or label.startswith(MODULE_MARKER_PREFIX)
+            or label.startswith(VPN_PROVIDER_MARKER_PREFIX)
+        )
+        for label, item in existing.items():
+            if managed(label) and label not in desired:
+                self.client.json("DELETE", f"{api}/tag/{item['id']}", key)
+        for label in sorted(desired):
+            if label not in existing:
+                self.client.json("POST", f"{api}/tag", key, {"label": label})
+
     def detect_apps(self):
-        with ThreadPoolExecutor(max_workers=min(8, len(REQUIRED_APPS))) as executor:
-            apps = list(executor.map(self._detect_app, REQUIRED_APPS))
+        selected_apps = self._selected_apps()
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_apps)))) as executor:
+            apps = list(executor.map(self._detect_app, selected_apps))
         with self._setup_lock:
             self._setup_detection = apps
         self.runtime.event(f"Detected {sum(item['reachable'] for item in apps)} of {len(apps)} installed Umbrel Arr apps")
         return self.setup_snapshot()
+
+    def select_and_detect(self, enabled_services, vpn_provider):
+        selected = normalize_modules(
+            self.enabled_modules if enabled_services is None else enabled_services
+        )
+        provider = get_vpn_provider(vpn_provider or self.vpn_provider.id)
+        selected = normalize_modules(
+            (set(selected) - {"privado-vpn"}) | ({provider.service_id} if provider.service_id else set())
+        )
+        errors = validate_modules(selected)
+        if errors:
+            raise ValueError("; ".join(errors))
+        was_ready = self.ensure_setup_ready()
+        changed = selected != self.enabled_modules or provider.id != self.vpn_provider.id
+        self._set_modules(selected, provider.id)
+        self._selection_dirty = was_ready and changed
+        self._setup_detection = []
+        self._mark_setup_required()
+        return self.detect_apps()
 
     def _detect_app(self, slug):
         url = self.settings.url(slug)
@@ -331,7 +434,23 @@ class Reconciler:
     def confirm_setup(
         self, storage_mode="", root_ids=None,
         qbittorrent_username="admin", qbittorrent_temporary_password="",
+        enabled_services=None, vpn_provider="",
     ):
+        selected = normalize_modules(
+            self.enabled_modules if enabled_services is None else enabled_services
+        )
+        provider_id = vpn_provider or self.vpn_provider.id
+        provider = get_vpn_provider(provider_id)
+        selected = normalize_modules(
+            (set(selected) - {"privado-vpn"}) | ({provider.service_id} if provider.service_id else set())
+        )
+        errors = validate_modules(selected)
+        if errors:
+            raise ValueError("; ".join(errors))
+        if selected != self.enabled_modules or provider_id != self.vpn_provider.id:
+            self._set_modules(selected, provider_id)
+            self._setup_detection = []
+            raise ValueError("Module selection changed; run detection again before connecting apps")
         snapshot = self.setup_snapshot()
         if not snapshot["detectionComplete"]:
             raise ValueError("Detect installed apps before connecting them")
@@ -344,9 +463,12 @@ class Reconciler:
         ]
         if missing_keys:
             raise ValueError(f"Wait for these apps to generate API credentials: {', '.join(missing_keys)}")
-        if not storage_mode:
+        if not snapshot["vpnStatus"]["ready"]:
+            raise ValueError(snapshot["vpnStatus"]["detail"])
+        if self.arrs and not storage_mode:
             raise ValueError("Choose local, network, or existing library roots before confirming setup")
-        self._validate_storage_selection(storage_mode, root_ids or {})
+        if self.arrs:
+            self._validate_storage_selection(storage_mode, root_ids or {})
         key = self.settings.key("prowlarr")
         api = f"{self.settings.url('prowlarr')}/api/v1"
         tags = self.client.json("GET", f"{api}/tag", key)
@@ -358,13 +480,17 @@ class Reconciler:
             self.client.json("POST", f"{api}/tag", key, {"label": SETUP_MARKER_TAG})
         with self._setup_lock:
             self._setup_complete = True
-        self._onboard_qbittorrent(qbittorrent_username, qbittorrent_temporary_password)
-        self._apply_storage(storage_mode, root_ids or {})
+        self._replace_module_markers(selected, provider_id)
+        if "qbittorrent" in self.enabled_modules:
+            self._onboard_qbittorrent(qbittorrent_username, qbittorrent_temporary_password)
+        if self.arrs:
+            self._apply_storage(storage_mode, root_ids or {})
         tags = self.client.json("GET", f"{api}/tag", key)
         if not any(item.get("label", "").casefold() == SETUP_READY_MARKER_TAG for item in tags):
             self.client.json("POST", f"{api}/tag", key, {"label": SETUP_READY_MARKER_TAG})
         with self._setup_lock:
             self._setup_ready = True
+            self._selection_dirty = False
         self.runtime.event("Explicit setup completed; installed apps are now managed")
         self.reconcile_async()
         return self.setup_snapshot()
@@ -425,12 +551,12 @@ class Reconciler:
         folders = self._read_root_folders(required=True)
         if mode in PRESETS:
             self.storage.update_from_apis(folders, mode)
-            self.arrs = self._arr_instances()
+            self.arrs = [arr for arr in self._arr_instances() if arr.slug in self.enabled_modules]
             for arr in self.arrs:
                 self._ensure_root(arr)
             folders = self._read_root_folders(required=True)
             snapshot = self.storage.update_from_apis(folders, mode)
-            if set(snapshot["rootIds"]) != set(LOCAL_ROOTS):
+            if set(snapshot["rootIds"]) != {arr.slug for arr in self.arrs}:
                 raise RuntimeError("The selected preset roots were not accepted by every Arr app")
             marker_labels = [f"{STORAGE_MARKER_PREFIX}{mode}"]
         else:
@@ -443,10 +569,10 @@ class Reconciler:
                 raise ValueError("Choose one existing root-folder ID for every library")
             marker_labels = [
                 f"{STORAGE_MARKER_PREFIX}{slug}-{snapshot['rootIds'][slug]}"
-                for slug in LOCAL_ROOTS
+                for slug in {arr.slug for arr in self.arrs}
             ]
         self._replace_storage_markers(marker_labels)
-        self.arrs = self._arr_instances()
+        self.arrs = [arr for arr in self._arr_instances() if arr.slug in self.enabled_modules]
         return snapshot
 
     def _validate_storage_selection(self, mode, root_ids):
@@ -460,13 +586,15 @@ class Reconciler:
             slug: int(value) for slug, value in root_ids.items()
             if slug in LOCAL_ROOTS and str(value).strip()
         }
-        candidate = StorageSettings().update_from_apis(folders, "adopted", cleaned_ids)
+        candidate_storage = StorageSettings()
+        candidate_storage.set_enabled_modules(self.enabled_modules)
+        candidate = candidate_storage.update_from_apis(folders, "adopted", cleaned_ids)
         if candidate["actionRequired"]:
             raise ValueError("Choose one existing root-folder ID for every library")
 
     def _read_root_folders(self, required):
         folders = {}
-        for arr in self._arr_instances():
+        for arr in self.arrs:
             if not arr.url or not arr.api_key:
                 if required:
                     raise ValueError(f"{arr.name} API credentials are not available")
@@ -617,30 +745,19 @@ class Reconciler:
         }
 
     def check_vpn(self):
-        status = self.client.json("GET", f"{self.settings.url('privado-vpn')}/api/status")
-        if status.get("state") == "healthy":
-            public_ip = status.get("publicIp") or "private exit"
-            return f"WireGuard and SOCKS5 are healthy via {public_ip}"
-        if not status.get("credentialsConfigured"):
-            return "action_required", "Enter your Privado login to start the tunnel"
-        return "waiting", f"Privado is {status.get('state', 'starting')}; waiting for WireGuard and SOCKS5"
+        status, detail = self.vpn_provider.check(self.settings, self.client)
+        return detail if status == "healthy" else (status, detail)
 
     def save_vpn_login(self, username, password):
-        if not username.strip() or not password:
-            raise ValueError("Privado username and password are required")
-        self.client.form(
-            "POST",
-            f"{self.settings.url('privado-vpn')}/setup",
-            {"username": username.strip(), "password": password},
-        )
-        self.runtime.event("Privado login forwarded to the VPN app")
+        self.vpn_provider.save_login(self.settings, self.client, username, password)
+        self.runtime.event(f"{self.vpn_provider.name} login forwarded to the provider app")
         self.reconcile_async()
 
     def check_flaresolverr(self):
         response = self.client.json("POST", f"{self.settings.url('flaresolverr')}/v1", payload={"cmd": "sessions.list", "maxTimeout": 10000})
         if response.get("status") != "ok":
             raise RuntimeError("FlareSolverr did not return a healthy response")
-        return "Challenge solver is reachable through the Privado proxy"
+        return f"Challenge solver is reachable through {self.vpn_provider.name} routing"
 
     def configure_qbittorrent(self, vpn_ok):
         base = f"{self.settings.url('qbittorrent')}/api/v2"
@@ -654,30 +771,47 @@ class Reconciler:
             if not self._qbit_login("admin", self.settings.qbittorrent_password):
                 return "action_required", "qBittorrent rejected its configured Umbrel password"
         if not vpn_ok:
-            return "waiting", "Waiting for a healthy Privado tunnel before applying proxy settings"
+            return "waiting", f"Waiting for {self.vpn_provider.name} before applying network settings"
         current = self.client.json(
             "GET", f"{base}/app/preferences", headers=self._qbit_headers(),
         ) or {}
         preferences = {
             **self._qbit_security_preferences(current),
-            "proxy_type": "SOCKS5",
-            "proxy_ip": self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_HOST", "umbrel-arr-privado-vpn_server_1"),
-            "proxy_port": int(self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_PORT", "1080")),
-            "proxy_peer_connections": True,
-            "proxy_hostname_lookup": True,
-            "proxy_bittorrent": True,
-            "proxy_misc": True,
-            "proxy_rss": True,
-            "proxy_torrents_only": False,
             "save_path": "/downloads/complete/",
             "temp_path": "/downloads/incomplete/",
             "temp_path_enabled": True,
         }
+        proxy = self.vpn_provider.proxy(self.settings)
+        if proxy:
+            preferences.update({
+                "proxy_type": "SOCKS5",
+                "proxy_ip": proxy.host,
+                "proxy_port": proxy.port,
+                "proxy_peer_connections": True,
+                "proxy_hostname_lookup": True,
+                "proxy_bittorrent": True,
+                "proxy_misc": True,
+                "proxy_rss": True,
+                "proxy_torrents_only": False,
+            })
+        else:
+            preferences.update({
+                "proxy_type": "None",
+                "proxy_ip": "",
+                "proxy_port": 0,
+                "proxy_peer_connections": False,
+                "proxy_hostname_lookup": False,
+                "proxy_bittorrent": False,
+                "proxy_misc": False,
+                "proxy_rss": False,
+                "proxy_torrents_only": False,
+            })
         self.client.form(
             "POST", f"{base}/app/setPreferences",
             {"json": json.dumps(preferences)}, self._qbit_headers(),
         )
-        for category in ("movies", "movies-4k", "tv", "tv-4k", "music"):
+        selected_categories = {arr.category for arr in self.arrs}
+        for category in (value for value in ("movies", "movies-4k", "tv", "tv-4k", "music") if value in selected_categories):
             try:
                 self.client.form(
                     "POST", f"{base}/torrents/createCategory",
@@ -687,7 +821,9 @@ class Reconciler:
             except RequestError as error:
                 if error.status != 409:
                     raise
-        return "Privado SOCKS5, shared paths, and five media categories are configured"
+        route = f"{self.vpn_provider.name} SOCKS5" if proxy else "direct routing"
+        category_count = "five" if len(selected_categories) == 5 else str(len(selected_categories))
+        return f"{route}, shared paths, and {category_count} media categories are configured"
 
     def configure_sabnzbd(self, vpn_ok):
         url = self.settings.url("sabnzbd")
@@ -696,7 +832,7 @@ class Reconciler:
             return "waiting", "Waiting for SABnzbd to persist its API key"
         self._sab_call(url, key, {"mode": "version"})
         if not vpn_ok:
-            return "waiting", "Waiting for a healthy Privado tunnel before applying proxy settings"
+            return "waiting", f"Waiting for {self.vpn_provider.name} before applying network settings"
         whitelist_response = self._sab_call(
             url, key,
             {"mode": "get_config", "section": "misc", "keyword": "host_whitelist"},
@@ -724,17 +860,21 @@ class Reconciler:
                     "value": ",".join(entries),
                 },
             )
+        proxy = self.vpn_provider.proxy(self.settings)
         for keyword, value in {
-            "socks5_proxy_url": f"socks5://{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_HOST', 'umbrel-arr-privado-vpn_server_1')}:{self.settings.env.get('UMBREL_ARR_PRIVADO_SOCKS_PORT', '1080')}",
+            "socks5_proxy_url": f"socks5://{proxy.host}:{proxy.port}" if proxy else "",
             "complete_dir": "/downloads/complete",
             "download_dir": "/downloads/incomplete",
             "username": "",
             "password": "",
         }.items():
             self._sab_call(url, key, {"mode": "set_config", "section": "misc", "keyword": keyword, "value": value})
-        for category in ("movies", "movies-4k", "tv", "tv-4k", "music"):
+        selected_categories = {arr.category for arr in self.arrs}
+        for category in (value for value in ("movies", "movies-4k", "tv", "tv-4k", "music") if value in selected_categories):
             self._sab_call(url, key, {"mode": "set_config", "section": "categories", "name": category, "dir": category})
-        return "Privado SOCKS5, shared paths, and five media categories are configured"
+        route = f"{self.vpn_provider.name} SOCKS5" if proxy else "direct routing"
+        category_count = "five" if len(selected_categories) == 5 else str(len(selected_categories))
+        return f"{route}, shared paths, and {category_count} media categories are configured"
 
     def _sab_call(self, url, key, values):
         query = {**values, "apikey": key, "output": "json"}
@@ -754,9 +894,15 @@ class Reconciler:
             return "waiting", f"Waiting for {arr.name} to persist its API key"
         self.client.json("GET", f"{arr.api}/system/status", arr.api_key)
         self._ensure_root(arr)
-        self._ensure_download_client(arr, "QBittorrent", "Umbrel Arr qBittorrent", self.settings.url("qbittorrent"))
-        self._ensure_download_client(arr, "Sabnzbd", "Umbrel Arr SABnzbd", self.settings.url("sabnzbd"), self.settings.key("sabnzbd"))
-        return f"Root {arr.root} and both {arr.category} download clients are configured"
+        clients = []
+        if "qbittorrent" in self.enabled_modules:
+            self._ensure_download_client(arr, "QBittorrent", "Umbrel Arr qBittorrent", self.settings.url("qbittorrent"))
+            clients.append("qBittorrent")
+        if "sabnzbd" in self.enabled_modules:
+            self._ensure_download_client(arr, "Sabnzbd", "Umbrel Arr SABnzbd", self.settings.url("sabnzbd"), self.settings.key("sabnzbd"))
+            clients.append("SABnzbd")
+        suffix = f" and {', '.join(clients)}" if clients else ""
+        return f"Root {arr.root}{suffix} are configured"
 
     def _ensure_root(self, arr):
         existing = self.client.json("GET", f"{arr.api}/rootfolder", arr.api_key)
@@ -810,18 +956,20 @@ class Reconciler:
             return "waiting", "Waiting for Prowlarr to persist its API key"
         api = f"{url}/api/v1"
         self.client.json("GET", f"{api}/system/status", key)
+        proxy = self.vpn_provider.proxy(self.settings) if vpn_ok else None
         if vpn_ok:
             config = self.client.json("GET", f"{api}/config/host", key)
             config.update({
-                "proxyEnabled": True,
-                "proxyType": "socks5",
-                "proxyHostname": self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_HOST", "umbrel-arr-privado-vpn_server_1"),
-                "proxyPort": int(self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_PORT", "1080")),
-                "proxyBypassFilter": ",".join(f"umbrel-arr-{slug}_server_1" for slug in NAMES),
+                "proxyEnabled": bool(proxy),
+                "proxyType": "socks5" if proxy else config.get("proxyType", "http"),
+                "proxyHostname": proxy.host if proxy else "",
+                "proxyPort": proxy.port if proxy else 0,
+                "proxyBypassFilter": ",".join(f"umbrel-arr-{slug}_server_1" for slug in self.enabled_modules),
                 "proxyBypassLocalAddresses": True,
             })
             self.client.json("PUT", f"{api}/config/host/{config.get('id', 1)}", key, config)
-        self._configure_flaresolverr_proxy(api, key)
+        if "flaresolverr" in self.enabled_modules:
+            self._configure_flaresolverr_proxy(api, key)
         schemas = self.client.json("GET", f"{api}/applications/schema", key)
         existing = self.client.json("GET", f"{api}/applications", key)
         for arr in self.arrs:
@@ -829,8 +977,9 @@ class Reconciler:
             self._set_fields(payload, {"prowlarrUrl": url, "baseUrl": arr.url, "apiKey": arr.api_key})
             payload.update({"name": f"Umbrel Arr {arr.name}", "syncLevel": "fullSync", "tags": []})
             self._upsert(api, "applications", key, payload, existing)
-        vpn_note = "VPN proxy and " if vpn_ok else ""
-        return f"{vpn_note}FlareSolverr plus five full-sync Arr applications are configured"
+        network_note = f"{self.vpn_provider.name} routing and " if proxy else ""
+        solver_note = "FlareSolverr plus " if "flaresolverr" in self.enabled_modules else ""
+        return f"{network_note}{solver_note}{len(self.arrs)} full-sync Arr applications are configured"
 
     def _configure_flaresolverr_proxy(self, api, key):
         tags = self.client.json("GET", f"{api}/tag", key)
@@ -862,15 +1011,23 @@ class Reconciler:
             "settings-radarr-ssl": "false",
             "settings-radarr-apikey": self.settings.key("radarr"),
         }
-        if vpn_ok:
+        proxy = self.vpn_provider.proxy(self.settings) if vpn_ok else None
+        if proxy:
             values.update({
                 "settings-proxy-type": "socks5",
-                "settings-proxy-url": self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_HOST", "umbrel-arr-privado-vpn_server_1"),
-                "settings-proxy-port": self.settings.env.get("UMBREL_ARR_PRIVADO_SOCKS_PORT", "1080"),
+                "settings-proxy-url": proxy.host,
+                "settings-proxy-port": str(proxy.port),
                 "settings-proxy-exclude": ["localhost", "127.0.0.1", urlsplit(self.settings.url("sonarr")).hostname, urlsplit(self.settings.url("radarr")).hostname],
             })
+        else:
+            values.update({
+                "settings-proxy-type": "",
+                "settings-proxy-url": "",
+                "settings-proxy-port": "",
+                "settings-proxy-exclude": [],
+            })
         self.client.form("POST", f"{self.settings.url('bazarr')}/api/system/settings", values, {"X-API-KEY": key})
-        return "HD Sonarr and Radarr are connected" + (" through Privado" if vpn_ok else "")
+        return "HD Sonarr and Radarr are connected" + (f" through {self.vpn_provider.name}" if proxy else "")
 
     def configure_profilarr(self):
         url = self.settings.url("profilarr")
@@ -881,21 +1038,22 @@ class Reconciler:
         if database is None:
             self.client.form("POST", f"{url}/databases/new", {"name": "Dictionarry", "repository_url": DATABASE_URL, "branch": "v2", "sync_strategy": "1440", "auto_pull": "1"}, form_headers)
             return "waiting", "Dictionarry database link queued; waiting for Profilarr to index it"
+        video_arrs = [arr for arr in self.arrs if arr.slug in HD_UHD_VIDEO_APPS]
         instances = self.client.json("GET", f"{url}/api/v1/arr")
         current = {item.get("name"): item for item in instances}
-        for arr in self.arrs[:4]:
+        for arr in video_arrs:
             if arr.name not in current:
                 self.client.form("POST", f"{url}/arr/new", {"name": arr.name, "type": arr.implementation.lower(), "url": arr.url, "external_url": self.settings.external_url(arr.slug), "api_key": arr.api_key, "tags": json.dumps(["4k" if arr.is_4k else "hd", MANAGED_TAG])}, form_headers)
         instances = self.client.json("GET", f"{url}/api/v1/arr")
         current = {item.get("name"): item for item in instances}
-        missing = [arr.name for arr in self.arrs[:4] if arr.name not in current]
+        missing = [arr.name for arr in video_arrs if arr.name not in current]
         if missing:
             return "waiting", f"Waiting for Profilarr Arr connections: {', '.join(missing)}"
         sync_marker_present = any(
             str(item.get("label", "")).casefold() == PROFILARR_SYNC_MARKER_TAG
             for item in self._prowlarr_tags()
         )
-        for arr in self.arrs[:4]:
+        for arr in video_arrs:
             profiles = UHD_PROFILES if arr.is_4k else HD_PROFILES
             selections = [{"databaseId": database["id"], "profileName": name} for name in profiles]
             instance_id = current[arr.name]["id"]
@@ -912,7 +1070,7 @@ class Reconciler:
                 "POST", f"{self.settings.url('prowlarr')}/api/v1/tag",
                 prowlarr_key, {"label": PROFILARR_SYNC_MARKER_TAG},
             )
-        return "Dictionarry profiles and referenced custom formats sync daily to four Arr instances"
+        return f"Dictionarry profiles and referenced custom formats sync daily to {len(video_arrs)} Arr instances"
 
     def configure_overseerr(self):
         url = self.settings.url("overseerr")
@@ -923,7 +1081,13 @@ class Reconciler:
         if not key:
             return "waiting", "Waiting for Overseerr to persist its API key"
         headers = {"X-API-Key": key}
-        for kind, arrs in (("sonarr", self.arrs[:2]), ("radarr", self.arrs[2:4])):
+        groups = {
+            "sonarr": [arr for arr in self.arrs if arr.implementation == "Sonarr"],
+            "radarr": [arr for arr in self.arrs if arr.implementation == "Radarr"],
+        }
+        for kind, arrs in groups.items():
+            if not arrs:
+                continue
             existing = self.client.json("GET", f"{url}/api/v1/settings/{kind}", headers=headers)
             for arr in arrs:
                 target = urlsplit(arr.url)

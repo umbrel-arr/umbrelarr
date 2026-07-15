@@ -1,4 +1,5 @@
 import json
+import socket
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -22,6 +23,13 @@ class Response:
 
 
 class HttpClient:
+    def tcp(self, host, port, timeout=3):
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                return True
+        except (OSError, TimeoutError, ValueError) as error:
+            raise RequestError(f"Could not reach {host}:{port}: {error}") from error
+
     def request(self, method, url, headers=None, body=None, timeout=20):
         request = Request(url, data=body, headers=headers or {}, method=method)
         try:

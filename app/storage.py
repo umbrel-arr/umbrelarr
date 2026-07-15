@@ -68,6 +68,7 @@ class StorageSettings:
 
     def __init__(self):
         self._lock = threading.RLock()
+        self.enabled_modules = set(LIBRARY_DEFINITIONS)
         self.data = {
             "mode": "local",
             "roots": dict(LOCAL_ROOTS),
@@ -76,32 +77,37 @@ class StorageSettings:
             "actionRequired": False,
         }
 
+    def set_enabled_modules(self, enabled):
+        with self._lock:
+            self.enabled_modules = set(enabled) & set(LIBRARY_DEFINITIONS)
+
     def root(self, slug):
         with self._lock:
-            return self.data["roots"][slug]
+            return self.data["roots"].get(slug, LOCAL_ROOTS[slug])
 
     def update_from_apis(self, folders, mode=None, root_ids=None):
         root_ids = {slug: int(value) for slug, value in (root_ids or {}).items()}
+        enabled = tuple(slug for slug in LOCAL_ROOTS if slug in self.enabled_modules)
         candidates = {
             slug: [
                 {"id": int(item["id"]), "path": str(item.get("path", "")).rstrip("/") or "/"}
                 for item in folders.get(slug, [])
                 if item.get("id") is not None and item.get("path")
             ]
-            for slug in LOCAL_ROOTS
+            for slug in enabled
         }
         selected_ids = {}
         roots = {}
         action_required = False
 
         if mode in PRESETS:
-            roots = dict(PRESETS[mode])
+            roots = {slug: PRESETS[mode][slug] for slug in enabled}
             for slug, path in roots.items():
                 match = next((item for item in candidates[slug] if item["path"] == path), None)
                 if match:
                     selected_ids[slug] = match["id"]
         elif mode == "adopted":
-            for slug in LOCAL_ROOTS:
+            for slug in enabled:
                 match = next((item for item in candidates[slug] if item["id"] == root_ids.get(slug)), None)
                 if match is None:
                     action_required = True
@@ -113,7 +119,7 @@ class StorageSettings:
             for preset_name, preset in PRESETS.items():
                 matches = {
                     slug: next((item for item in candidates[slug] if item["path"] == path), None)
-                    for slug, path in preset.items()
+                    for slug, path in preset.items() if slug in enabled
                 }
                 if all(matches.values()):
                     preset_matches.append((preset_name, preset, matches))
@@ -130,9 +136,9 @@ class StorageSettings:
                     else:
                         action_required = True
 
-        if set(roots) != set(LOCAL_ROOTS):
+        if set(roots) != set(enabled):
             action_required = True
-            for slug in LOCAL_ROOTS:
+            for slug in enabled:
                 roots.setdefault(slug, LOCAL_ROOTS[slug])
         with self._lock:
             self.data = {
@@ -155,9 +161,18 @@ class StorageSettings:
                     for slug, values in self.data["candidates"].items()
                 },
                 "actionRequired": self.data["actionRequired"],
-                "presets": {name: dict(values) for name, values in PRESETS.items()},
+                "presets": {
+                    name: {slug: path for slug, path in values.items() if slug in self.enabled_modules}
+                    for name, values in PRESETS.items()
+                },
                 "libraries": [
-                    {"key": key, "root": self.data["roots"][key], **definition}
+                    {
+                        "key": key,
+                        "root": self.data["roots"][key],
+                        **definition,
+                        "apps": [slug for slug in definition["apps"] if slug in self.enabled_modules],
+                    }
                     for key, definition in LIBRARY_DEFINITIONS.items()
+                    if key in self.enabled_modules
                 ],
             }

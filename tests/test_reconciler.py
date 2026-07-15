@@ -12,9 +12,11 @@ sys.path.insert(0, str(SOURCE))
 
 from dashboard import PAGE, render_page
 from api_keys import ApiKeyResolver
+from catalog import CORE_MODULES, STACK_PROFILES, dependencies_for, normalize_modules, validate_modules
 from http_client import RequestError, Response
 from reconciler import (
-    DEPENDENCIES, PROFILARR_SYNC_MARKER_TAG, REQUIRED_APPS,
+    DEPENDENCIES, MODULE_CATALOG_MARKER_TAG, MODULE_MARKER_PREFIX,
+    PROFILARR_SYNC_MARKER_TAG, REQUIRED_APPS, VPN_PROVIDER_MARKER_PREFIX,
     SETUP_MARKER_TAG, SETUP_READY_MARKER_TAG, Reconciler, Settings,
 )
 from state import RuntimeState, ServiceStatus
@@ -56,6 +58,10 @@ class FakeClient:
     def request(self, method, url, headers=None, body=None, timeout=20):
         self.calls.append(("request", method, url, headers, body))
         return Response(200, {}, b"ok")
+
+    def tcp(self, host, port, timeout=3):
+        self.calls.append(("tcp", host, port, timeout))
+        return True
 
     def form(self, method, url, values, headers=None):
         self.calls.append(("form", method, url, headers, values))
@@ -265,6 +271,94 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(instances["radarr"], ("/downloads/movies", "movies", False))
         self.assertEqual(instances["radarr-4k"], ("/downloads/movies-4k", "movies-4k", True))
         self.assertEqual(instances["lidarr"], ("/downloads/music", "music", False))
+
+    def test_module_catalog_derives_dependencies_from_selection(self):
+        selected = {"umbrelarr", "prowlarr", "qbittorrent", "sonarr"}
+        dependencies = dependencies_for(selected)
+        self.assertEqual(dependencies["sonarr"], ("umbrelarr", "qbittorrent"))
+        self.assertEqual(dependencies["prowlarr"], ("sonarr",))
+        self.assertNotIn("privado-vpn", dependencies)
+        self.assertEqual(validate_modules({"bazarr"}), ["Bazarr requires Sonarr and Radarr"])
+        self.assertTrue(CORE_MODULES <= set(selected))
+
+    def test_every_starting_profile_is_valid_and_keeps_the_required_core(self):
+        profiles = {profile.id: profile for profile in STACK_PROFILES}
+        self.assertEqual(set(profiles), {"core", "tv-torrent", "video-usenet", "full"})
+        for profile in profiles.values():
+            selected = normalize_modules(profile.enabled_services)
+            self.assertTrue(CORE_MODULES <= selected, profile.id)
+            self.assertEqual(validate_modules(selected), [], profile.id)
+        self.assertEqual(
+            normalize_modules(profiles["tv-torrent"].enabled_services),
+            frozenset({"umbrelarr", "prowlarr", "qbittorrent", "sonarr"}),
+        )
+
+    def test_selected_modules_limit_read_only_detection(self):
+        snapshot = self.reconciler.select_and_detect(
+            ["prowlarr", "sonarr", "qbittorrent"], "direct",
+        )
+        self.assertEqual(snapshot["vpnProvider"], "direct")
+        self.assertEqual(snapshot["requiredCount"], 3)
+        self.assertEqual(
+            {item["id"] for item in snapshot["apps"]},
+            {"prowlarr", "sonarr", "qbittorrent"},
+        )
+        self.assertNotIn("privado-vpn", self.reconciler.enabled_modules)
+        requests = [call for call in self.client.calls if call[0] == "request"]
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(call[1] == "GET" for call in requests))
+
+    def test_modular_selection_and_provider_restore_from_api_markers(self):
+        client = FakeClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler.select_and_detect(["prowlarr", "sonarr"], "direct")
+        reconciler.reconcile_async = lambda: True
+        snapshot = reconciler.confirm_setup(
+            "local", enabled_services=["prowlarr", "sonarr"], vpn_provider="direct",
+        )
+        self.assertTrue(snapshot["confirmed"])
+        labels = {item["label"] for item in client.tags}
+        self.assertIn(MODULE_CATALOG_MARKER_TAG, labels)
+        self.assertIn(f"{VPN_PROVIDER_MARKER_PREFIX}direct", labels)
+        self.assertIn(f"{MODULE_MARKER_PREFIX}sonarr", labels)
+        self.assertNotIn(f"{MODULE_MARKER_PREFIX}privado-vpn", labels)
+
+        restored = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(restored.ensure_setup())
+        self.assertEqual(restored.vpn_provider.id, "direct")
+        self.assertEqual(restored.enabled_modules, {"umbrelarr", "prowlarr", "sonarr"})
+        self.assertEqual([arr.slug for arr in restored.arrs], ["sonarr"])
+
+    def test_legacy_setup_without_module_markers_keeps_complete_privado_stack(self):
+        client = FakeClient()
+        client.tags.append({"id": 1, "label": SETUP_MARKER_TAG})
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(reconciler.ensure_setup())
+        self.assertEqual(reconciler.vpn_provider.id, "privado")
+        self.assertEqual(set(reconciler._selected_apps()), set(REQUIRED_APPS))
+
+    def test_confirmed_stack_can_detect_and_apply_a_new_module_selection(self):
+        client = FakeClient()
+        labels = [
+            SETUP_MARKER_TAG,
+            SETUP_READY_MARKER_TAG,
+            MODULE_CATALOG_MARKER_TAG,
+            f"{VPN_PROVIDER_MARKER_PREFIX}privado",
+            f"{MODULE_MARKER_PREFIX}umbrelarr",
+            f"{MODULE_MARKER_PREFIX}prowlarr",
+            f"{MODULE_MARKER_PREFIX}privado-vpn",
+            f"{MODULE_MARKER_PREFIX}sonarr",
+        ]
+        client.tags.extend({"id": index + 1, "label": label} for index, label in enumerate(labels))
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(reconciler.ensure_setup_ready())
+
+        snapshot = reconciler.select_and_detect(["prowlarr", "sonarr"], "direct")
+
+        self.assertTrue(snapshot["configurationChanged"])
+        self.assertEqual(snapshot["phase"], "ready")
+        self.assertTrue(snapshot["canConfirm"])
+        self.assertEqual(snapshot["vpnProvider"], "direct")
 
     def test_reconciliation_is_blocked_until_explicit_setup(self):
         snapshot = self.reconciler.setup_snapshot()
@@ -476,6 +570,39 @@ class ReconcilerTests(unittest.TestCase):
         self.client.vpn = {"credentialsConfigured": True, "state": "healthy", "publicIp": "203.0.113.7"}
         self.assertIn("203.0.113.7", self.reconciler.check_vpn())
 
+    def test_generic_socks_provider_probes_the_selected_endpoint(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_SOCKS5_HOST"] = "socks-gateway"
+        values["UMBREL_ARR_SOCKS5_PORT"] = "1088"
+        reconciler = Reconciler(Settings(values), self.client)
+        reconciler._set_modules({"prowlarr"}, "generic-socks5")
+
+        self.assertIn("socks-gateway:1088", reconciler.check_vpn())
+        self.assertIn(("tcp", "socks-gateway", 1088, 3), self.client.calls)
+
+    def test_generic_socks_setup_is_blocked_until_the_endpoint_is_configured(self):
+        snapshot = self.reconciler.select_and_detect(["prowlarr"], "generic-socks5")
+
+        self.assertFalse(snapshot["canConfirm"])
+        self.assertEqual(snapshot["vpnStatus"]["status"], "action_required")
+        self.assertIn("UMBREL_ARR_SOCKS5_HOST", snapshot["vpnStatus"]["detail"])
+
+    def test_unreachable_external_vpn_becomes_waiting_without_aborting_reconciliation(self):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_SOCKS5_HOST"] = "missing-gateway"
+        reconciler = Reconciler(Settings(values), self.client)
+        reconciler._set_modules({"prowlarr"}, "generic-socks5")
+        reconciler._setup_complete = True
+        reconciler._setup_ready = True
+        self.client.tcp = lambda *_args, **_kwargs: (_ for _ in ()).throw(RequestError("offline"))
+
+        reconciler.reconcile()
+
+        services = {item["id"]: item for item in reconciler.runtime.snapshot()["services"]}
+        self.assertEqual(services["umbrelarr"]["status"], "waiting")
+        self.assertEqual(services["prowlarr"]["status"], "waiting")
+        self.assertFalse(reconciler.runtime.running)
+
     def test_vpn_login_is_forwarded_without_persistence(self):
         self.reconciler.reconcile_async = lambda: True
         self.reconciler.save_vpn_login("member", "very-secret")
@@ -506,6 +633,19 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(preferences["proxy_ip"], "vpn")
         self.assertEqual(categories, ["movies", "movies-4k", "tv", "tv-4k", "music"])
         self.assertIn("five media categories", detail)
+
+    def test_direct_provider_clears_owned_qbittorrent_proxy_fields(self):
+        client = QbitAuthClient(active_password="umbrel-password")
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        reconciler._set_modules(
+            {"prowlarr", "qbittorrent", "sonarr"}, "direct",
+        )
+        reconciler._qbit_login("admin", "umbrel-password")
+        detail = reconciler.configure_qbittorrent(True)
+        self.assertIn("direct routing", detail)
+        self.assertEqual(client.preferences["proxy_type"], "None")
+        self.assertEqual(client.preferences["proxy_ip"], "")
+        self.assertFalse(client.preferences["proxy_bittorrent"])
 
     def test_sabnzbd_uses_current_socks_setting(self):
         original_form = self.client.form

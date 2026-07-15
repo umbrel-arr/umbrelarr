@@ -47,6 +47,32 @@ const confirmedSetup = {
   apps: [],
 };
 
+function modularSetup() {
+  return {
+    ...confirmedSetup,
+    phase: 'detect',
+    confirmed: false,
+    canConfirm: false,
+    detectionComplete: false,
+    enabledServices: ['umbrelarr', 'prowlarr', 'qbittorrent', 'sonarr'],
+    modules: [
+      { id: 'prowlarr', name: 'Prowlarr', role: 'indexer_manager', enabled: true, required: true },
+      { id: 'qbittorrent', name: 'qBittorrent', role: 'download_client', enabled: true, required: false },
+      { id: 'sonarr', name: 'Sonarr', role: 'media_manager', enabled: true, required: false },
+      { id: 'privado-vpn', name: 'Privado VPN', role: 'vpn_provider', enabled: true, required: false },
+    ],
+    vpnProvider: 'privado',
+    vpnProviders: [
+      { id: 'privado', name: 'Privado VPN', service_id: 'privado-vpn' },
+      { id: 'direct', name: 'No VPN', service_id: null },
+    ],
+    profiles: [
+      { id: 'core', name: 'Core only', description: 'Prowlarr only.', enabledServices: ['prowlarr'] },
+      { id: 'tv-torrent', name: 'TV with torrents', description: 'Prowlarr, qBittorrent, and Sonarr.', enabledServices: ['prowlarr', 'qbittorrent', 'sonarr'] },
+    ],
+  };
+}
+
 async function mockDashboard(page, status = 'healthy', delay = 0) {
   await page.route('**/api/setup', route => route.fulfill({ json: confirmedSetup }));
   await page.route('**/api/status', async route => {
@@ -129,11 +155,23 @@ test('supports keyboard filtering and service navigation with visible focus', as
 });
 
 test('submits explicit setup choices and the one-time qBittorrent credential', async ({ page }) => {
+  const modular = modularSetup();
   const setup = {
-    ...confirmedSetup,
+    ...modular,
     phase: 'ready',
     confirmed: false,
     canConfirm: true,
+    enabledServices: [
+      'umbrelarr', 'prowlarr', 'qbittorrent', 'sonarr', 'sonarr-4k',
+      'radarr', 'radarr-4k', 'lidarr',
+    ],
+    modules: [
+      ...modular.modules,
+      { id: 'sonarr-4k', name: 'Sonarr 4K', role: 'media_manager', enabled: true, required: false },
+      { id: 'radarr', name: 'Radarr', role: 'media_manager', enabled: true, required: false },
+      { id: 'radarr-4k', name: 'Radarr 4K', role: 'media_manager', enabled: true, required: false },
+      { id: 'lidarr', name: 'Lidarr', role: 'media_manager', enabled: true, required: false },
+    ],
     apps: [{
       id: 'qbittorrent',
       name: 'qBittorrent',
@@ -173,6 +211,52 @@ test('submits explicit setup choices and the one-time qBittorrent credential', a
     'radarr-4k': 13,
     lidarr: 14,
   });
+});
+
+test('detects only the selected service modules and VPN provider', async ({ page }) => {
+  const setup = modularSetup();
+  await page.route('**/api/status', route => route.fulfill({ json: statusFixture() }));
+  await page.route('**/api/setup', route => route.fulfill({ json: setup }));
+  await page.route('**/api/storage', route => route.fulfill({ json: storageFixture() }));
+  const requestPromise = page.waitForRequest('**/api/setup/detect');
+  await page.route('**/api/setup/detect', route => route.fulfill({ json: setup }));
+
+  await page.goto('/setup');
+  const modules = page.locator('[data-module]');
+  await expect(modules).toHaveCount(3);
+  await page.locator('[data-module][value="qbittorrent"]').uncheck();
+  await page.locator('#vpnProvider').selectOption('direct');
+  await page.locator('#detectApps').click();
+
+  const request = await requestPromise;
+  const body = new URLSearchParams(request.postData() || '');
+  expect(body.get('vpnProvider')).toBe('direct');
+  expect(JSON.parse(body.get('enabledServices'))).toEqual(['prowlarr', 'sonarr']);
+  await expectNoDocumentOverflow(page);
+});
+
+test('applies a starting profile without coupling it to the VPN provider', async ({ page }) => {
+  const setup = modularSetup();
+  await page.route('**/api/status', route => route.fulfill({ json: statusFixture() }));
+  await page.route('**/api/setup', route => route.fulfill({ json: setup }));
+  await page.route('**/api/storage', route => route.fulfill({ json: storageFixture() }));
+  const requestPromise = page.waitForRequest('**/api/setup/detect');
+  await page.route('**/api/setup/detect', route => route.fulfill({ json: setup }));
+
+  await page.goto('/setup');
+  await page.locator('#stackProfile').selectOption('core');
+  await expect(page.locator('[data-module][value="qbittorrent"]')).not.toBeChecked();
+  await expect(page.locator('[data-module][value="sonarr"]')).not.toBeChecked();
+  await expect(page.locator('#setupStorageOptions')).toBeHidden();
+  await expect(page.locator('#qbittorrentCredentials')).toBeHidden();
+  await expect(page.locator('#vpnProvider')).toHaveValue('privado');
+  await page.locator('#detectApps').click();
+
+  const request = await requestPromise;
+  const body = new URLSearchParams(request.postData() || '');
+  expect(JSON.parse(body.get('enabledServices'))).toEqual(['prowlarr']);
+  expect(body.get('vpnProvider')).toBe('privado');
+  await expectNoDocumentOverflow(page);
 });
 
 test('contains dependency graph overflow inside its keyboard-scrollable region', async ({ page }, testInfo) => {
