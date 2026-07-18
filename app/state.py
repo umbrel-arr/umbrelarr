@@ -1,6 +1,7 @@
+import copy
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 
 VALID_STATES = {"unknown", "waiting", "action_required", "configuring", "healthy", "failed"}
@@ -10,10 +11,14 @@ VALID_STATES = {"unknown", "waiting", "action_required", "configuring", "healthy
 class ServiceStatus:
     id: str
     name: str
+    role: str = ""
     status: str = "unknown"
     detail: str = "Waiting for the first check"
     link: str = ""
     checked_at: int = 0
+    checks: list = field(default_factory=list)
+    container: dict = field(default_factory=dict)
+    resources: dict = field(default_factory=dict)
 
 
 class RuntimeState:
@@ -37,6 +42,46 @@ class RuntimeState:
             service.status = status
             service.detail = detail
             service.checked_at = int(time.time())
+            service.checks.append({"at": service.checked_at, "status": status})
+            del service.checks[:-24]
+
+    def set_unchecked(self, service_id, status, detail):
+        """Describe a preflight state without pretending a health check ran."""
+        if status not in VALID_STATES:
+            raise ValueError(status)
+        with self._lock:
+            service = self.services[service_id]
+            service.status = status
+            service.detail = detail
+            service.checked_at = 0
+            service.checks.clear()
+
+    def set_resources(self, service_id, resources):
+        """Store a resource snapshot supplied by the constrained host integration."""
+        with self._lock:
+            self.services[service_id].resources = copy.deepcopy(resources or {})
+
+    def retain_resources(self, service_id, source="docker"):
+        """Keep the last measured values without advancing their sample timestamp."""
+        with self._lock:
+            current = copy.deepcopy(self.services[service_id].resources)
+            has_sample = bool(current.get("updatedAt")) and any(
+                current.get(key) not in (None, {})
+                for key in ("cpu", "memory", "blockIo", "network")
+            )
+            if has_sample:
+                current["sampleState"] = "last_sample"
+                self.services[service_id].resources = current
+            else:
+                self.services[service_id].resources = {
+                    "source": source,
+                    "sampleState": "unavailable",
+                }
+
+    def set_container(self, service_id, container):
+        """Store sanitized Docker runtime metadata for one managed service."""
+        with self._lock:
+            self.services[service_id].container = dict(container or {})
 
     def event(self, message, level="info"):
         with self._lock:

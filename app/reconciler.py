@@ -11,13 +11,13 @@ from urllib.parse import urlencode, urlsplit
 
 from api_keys import ApiKeyResolver
 from catalog import (
-    DEFAULT_MODULES, MEDIA_MODULES, MEDIA_SERVER_MODULES, MODULES, SERVICE_MODULES,
-    STACK_PROFILES, VIDEO_MODULES,
-    dependencies_for, normalize_modules, validate_modules,
+    CORE_MODULES, DEFAULT_MODULES, MEDIA_MODULES, MEDIA_SERVER_MODULES, MODULES,
+    SERVICE_MODULES, VIDEO_MODULES, dependencies_for, normalize_modules,
+    validate_modules,
 )
 from http_client import HttpClient, RequestError
-from state import RuntimeState, ServiceStatus
-from storage import LOCAL_ROOTS, PRESETS, StorageSettings
+from state import VALID_STATES, RuntimeState, ServiceStatus
+from storage import LOCAL_ROOTS, NETWORK_ROOTS, PRESETS, StorageSettings
 from vpn import VPN_PROVIDERS, get_vpn_provider
 
 
@@ -75,29 +75,224 @@ class ArrInstance:
 
 class Settings:
     def __init__(self, environ=None):
-        env = environ or os.environ
+        env = os.environ if environ is None else environ
         self.env = env
-        self.device_domain = env.get("DEVICE_DOMAIN_NAME", "umbrel.local")
-        self.interval = max(30, int(env.get("RECONCILE_INTERVAL", "300")))
-        self.api_keys = ApiKeyResolver(env.get("UMBREL_ARR_MANAGED_CONFIG_DIR", "/managed-config"))
-        configured_modules = env.get("UMBREL_ARR_ENABLED_SERVICES", "")
-        self.enabled_modules = normalize_modules(
-            configured_modules.split(",") if configured_modules.strip() else DEFAULT_MODULES
+        legacy_device_domain = env.get("DEVICE_DOMAIN_NAME", "umbrel.local").strip()
+        configured_base_url = env.get("UMBREL_ARR_BASE_URL", "").strip()
+        self.base_url = self._normalize_base_url(
+            configured_base_url or f"http://{legacy_device_domain}"
         )
-        self.vpn_provider_id = env.get("UMBREL_ARR_VPN_PROVIDER", "privado").strip() or "privado"
+        self.device_domain = urlsplit(self.base_url).hostname
+        self.interval = max(30, int(env.get("RECONCILE_INTERVAL", "300")))
+        self.telemetry_interval = max(
+            5, int(env.get("UMBREL_ARR_DOCKER_TELEMETRY_INTERVAL", "30"))
+        )
+        self.docker_broker_url = env.get(
+            "UMBREL_ARR_DOCKER_BROKER_URL", ""
+        ).strip().rstrip("/")
+        self.docker_broker_token = env.get(
+            "UMBREL_ARR_DOCKER_BROKER_TOKEN", ""
+        ).strip()
+        self.api_keys = ApiKeyResolver(env.get("UMBREL_ARR_MANAGED_CONFIG_DIR", "/managed-config"))
+        self._runtime_urls = {}
+        self._runtime_keys = {}
+        self._runtime_key_sources = {}
+        configured_modules = env.get("UMBREL_ARR_ENABLED_SERVICES", "").strip()
+        self.modules_configured = bool(configured_modules)
+        self.enabled_modules = normalize_modules(
+            configured_modules.split(",") if configured_modules else CORE_MODULES
+        )
+        configured_provider = env.get("UMBREL_ARR_VPN_PROVIDER", "").strip()
+        self.vpn_provider_configured = bool(configured_provider)
+        self.vpn_provider_id = configured_provider or (
+            "privado" if "privado-vpn" in self.enabled_modules else "direct"
+        )
+
+    @staticmethod
+    def _normalize_base_url(value):
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("UMBREL_ARR_BASE_URL must be a valid HTTP or HTTPS URL") from error
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or port is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "UMBREL_ARR_BASE_URL must be an HTTP or HTTPS origin without a port, credentials, path, query, or fragment"
+            )
+        hostname = parsed.hostname
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        return f"{parsed.scheme}://{host}"
 
     def url(self, slug):
+        runtime = self._runtime_urls.get(slug, "")
+        if runtime:
+            return runtime
         key = f"UMBREL_ARR_{slug.upper().replace('-', '_')}_URL"
-        return self.env.get(key, "").rstrip("/")
+        configured = self.env.get(key, "").strip().rstrip("/")
+        return configured or self.external_url(slug)
+
+    def url_is_configured(self, slug):
+        if self._runtime_urls.get(slug):
+            return True
+        key = f"UMBREL_ARR_{slug.upper().replace('-', '_')}_URL"
+        return bool(self.env.get(key, "").strip())
+
+    def runtime_url_is_configured(self, slug):
+        return bool(self._runtime_urls.get(slug))
 
     def key(self, slug):
-        key = f"UMBREL_ARR_{slug.upper().replace('-', '_')}_API_KEY"
+        runtime = self._runtime_keys.get(slug, "")
+        if runtime:
+            return runtime
+        key = self.api_key_environment_variable(slug)
         exported = self.env.get(key, "").strip()
         return exported or self.api_keys.resolve(slug)
 
+    @staticmethod
+    def api_key_environment_variable(slug):
+        return f"UMBREL_ARR_{slug.upper().replace('-', '_')}_API_KEY"
+
+    def credential_metadata(self, slug):
+        """Describe credential availability without returning a secret value."""
+        module = MODULES.get(slug)
+        if module is not None and not module.requires_api_key:
+            return {}
+        environment_variable = self.api_key_environment_variable(slug)
+        environment_configured = bool(
+            self.env.get(environment_variable, "").strip()
+        )
+        if self._runtime_keys.get(slug):
+            source = self._runtime_key_sources.get(slug, "ui")
+            configured = True
+        elif environment_configured:
+            source = "environment"
+            configured = True
+        elif self.api_keys.resolve(slug):
+            source = "managed_config"
+            configured = True
+        else:
+            source = "missing"
+            configured = False
+        return {
+            "apiKeyEnvironmentVariable": environment_variable,
+            "credentialSource": source,
+            "credentialConfigured": configured,
+            "environmentCredentialConfigured": environment_configured,
+        }
+
+    def connection_overrides(self):
+        return {
+            "urls": dict(self._runtime_urls),
+            "keys": dict(self._runtime_keys),
+            "keySources": dict(self._runtime_key_sources),
+        }
+
+    def restore_connection_overrides(self, snapshot):
+        snapshot = snapshot or {}
+        self._runtime_urls = dict(snapshot.get("urls", {}))
+        self._runtime_keys = dict(snapshot.get("keys", {}))
+        self._runtime_key_sources = {
+            slug: source
+            for slug, source in snapshot.get("keySources", {}).items()
+            if slug in self._runtime_keys and source in {"ui", "service_api"}
+        }
+
+    def set_runtime_key(self, slug, value, source="ui"):
+        if source not in {"ui", "service_api"}:
+            raise ValueError("Choose a supported runtime credential source")
+        value = ApiKeyResolver._clean(value)
+        if not value:
+            raise ValueError(f"Enter a valid API key for {NAMES.get(slug, slug)}")
+        self._runtime_keys[slug] = value
+        self._runtime_key_sources[slug] = source
+
+    def apply_connections(self, connections, selected_modules):
+        if connections is None:
+            return False
+        if not isinstance(connections, dict):
+            raise ValueError("connections must be a JSON object")
+        selected = set(selected_modules)
+        normalized = {}
+        for slug, raw in connections.items():
+            module = MODULES.get(slug)
+            if module is None or slug == "umbrelarr" or slug not in selected:
+                raise ValueError("Connection details must belong to a selected service")
+            if not isinstance(raw, dict):
+                raise ValueError(f"Connection details for {module.name} must be an object")
+            address = str(raw.get("url", "")).strip()
+            api_key = str(raw.get("apiKey", "")).strip()
+            credential_source = str(raw.get("credentialSource", "")).strip()
+            if credential_source not in {"", "environment", "ui"}:
+                raise ValueError(
+                    f"Choose environment or UI credentials for {module.name}"
+                )
+            if credential_source and not module.requires_api_key:
+                raise ValueError(f"{module.name} does not use an API key")
+            if credential_source == "environment" and api_key:
+                raise ValueError(
+                    f"Do not submit an API key when {module.name} uses an environment variable"
+                )
+            if address:
+                if len(address) > 2048 or any(character.isspace() for character in address):
+                    raise ValueError(f"Enter a valid service address for {module.name}")
+                parsed = urlsplit(address)
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username
+                    or parsed.password
+                    or parsed.query
+                    or parsed.fragment
+                ):
+                    raise ValueError(
+                        f"{module.name} service address must be an HTTP or HTTPS URL without credentials, a query, or a fragment"
+                    )
+                address = address.rstrip("/")
+            if api_key:
+                if not module.requires_api_key:
+                    raise ValueError(f"{module.name} does not use an API key")
+                if len(api_key) > 512 or any(character.isspace() for character in api_key):
+                    raise ValueError(f"Enter a valid API key for {module.name}")
+            normalized[slug] = {
+                "url": address,
+                "apiKey": api_key,
+                "credentialSource": credential_source,
+            }
+
+        changed = False
+        for slug, values in normalized.items():
+            address = values["url"]
+            api_key = values["apiKey"]
+            credential_source = values["credentialSource"]
+            if address and self._runtime_urls.get(slug) != address:
+                self._runtime_urls[slug] = address
+                changed = True
+            if credential_source == "environment":
+                if self._runtime_keys.pop(slug, None):
+                    changed = True
+                self._runtime_key_sources.pop(slug, None)
+            if api_key and self._runtime_keys.get(slug) != api_key:
+                self.set_runtime_key(slug, api_key, "ui")
+                changed = True
+        return changed
+
+    def clear_runtime_connection(self, slug):
+        self._runtime_urls.pop(slug, None)
+        self._runtime_keys.pop(slug, None)
+        self._runtime_key_sources.pop(slug, None)
+
     def external_url(self, slug):
         port = APP_PORTS.get(slug)
-        return f"http://{self.device_domain}:{port}" if port else ""
+        return f"{self.base_url}:{port}" if port else ""
 
     @property
     def qbittorrent_password(self):
@@ -117,8 +312,15 @@ class Reconciler:
         self._setup_complete = False
         self._setup_ready = False
         self._selection_dirty = False
+        self._draft_modules = None
+        self._draft_vpn_provider_id = ""
+        self._draft_connection_restore = None
         self._setup_detection = []
         self._qbittorrent_cookie = ""
+        self._container_services = {}
+        self._container_updated_at = 0
+        self._container_error = ""
+        self._container_refresh_lock = threading.Lock()
         self.enabled_modules = frozenset()
         self.vpn_provider = get_vpn_provider(self.settings.vpn_provider_id)
         self._set_modules(self.settings.enabled_modules, self.vpn_provider.id)
@@ -136,12 +338,18 @@ class Reconciler:
         dependencies = dependencies_for(self.enabled_modules, provider.service_id)
         previous_events = list(getattr(getattr(self, "runtime", None), "events", []))
         services = [
-            ServiceStatus(slug, NAMES[slug], link=self.settings.external_url(slug))
+            ServiceStatus(
+                slug,
+                NAMES[slug],
+                role=MODULES[slug].role,
+                link=self.settings.external_url(slug),
+            )
             for slug in NAMES if slug in self.enabled_modules
         ]
         self.runtime = RuntimeState(services, dependencies)
         self.runtime.events = previous_events
         self.arrs = [arr for arr in self._arr_instances() if arr.slug in self.enabled_modules]
+        self._apply_container_snapshot()
 
     def _selected_apps(self):
         return tuple(slug for slug in NAMES if slug != "umbrelarr" and slug in self.enabled_modules)
@@ -230,9 +438,14 @@ class Reconciler:
             self.runtime.complete()
 
     def _mark_setup_required(self):
-        self.runtime.set("umbrelarr", "action_required", "Detect and connect the Umbrel Arr apps you installed")
+        self.runtime.set_unchecked(
+            "umbrelarr", "action_required",
+            "Choose the services you installed, then check and connect them",
+        )
         for slug in self._selected_apps():
-            self.runtime.set(slug, "unknown", "Waiting for explicit Umbrelarr setup")
+            self.runtime.set_unchecked(
+                slug, "waiting", "Waiting for connection setup before the first health check",
+            )
 
     def ensure_setup(self):
         with self._setup_lock:
@@ -261,14 +474,34 @@ class Reconciler:
         ready = self.ensure_setup_ready()
         with self._setup_lock:
             apps = [dict(item) for item in self._setup_detection]
-        reachable = sum(item["reachable"] for item in apps)
-        selected_apps = self._selected_apps()
+            selected_modules = self._draft_modules or self.enabled_modules
+            provider_id = self._draft_vpn_provider_id or self.vpn_provider.id
+            container_services = copy.deepcopy(self._container_services)
+            container_updated_at = self._container_updated_at
+            container_error = self._container_error
+        provider = get_vpn_provider(provider_id)
+        container_authoritative = bool(
+            self.settings.docker_broker_url
+            and container_updated_at
+            and not container_error
+        )
+        if self.settings.docker_broker_url and container_error:
+            apps = [
+                self._detect_app(slug, {}, container_error)
+                for slug in NAMES
+                if slug != "umbrelarr" and slug in selected_modules
+            ]
+        detected = sum(item.get("detected", item["reachable"]) for item in apps)
+        selected_apps = tuple(
+            slug for slug in NAMES
+            if slug != "umbrelarr" and slug in selected_modules
+        )
         detection_complete = len(apps) == len(selected_apps)
         blocking = [
             item for item in apps
             if not item["reachable"] or (not item["credentials"] and item["id"] != "qbittorrent")
         ]
-        vpn_status = self._vpn_setup_status()
+        vpn_status = self._vpn_setup_status(provider)
         can_confirm = detection_complete and not blocking and vpn_status["ready"]
         if ready and self._selection_dirty:
             phase = "ready" if can_confirm else "action_required"
@@ -282,36 +515,63 @@ class Reconciler:
             phase = "ready"
         else:
             phase = "action_required"
+
+        def public_module(module):
+            credential = self.settings.credential_metadata(module.id)
+            return {
+                **module.public(),
+                "enabled": module.id in selected_modules,
+                "active": module.id in self.enabled_modules,
+                "installed": (
+                    module.id in container_services
+                    if container_authoritative else None
+                ),
+                "container": (
+                    copy.deepcopy(container_services.get(module.id, {}))
+                    if container_authoritative else {}
+                ),
+                "connectionUrl": self.settings.url(module.id),
+                "connectionConfigured": self.settings.url_is_configured(module.id),
+                **credential,
+            }
+
         return {
             "phase": phase,
             "confirmed": confirmed,
             "canConfirm": can_confirm,
             "requiredCount": len(selected_apps),
             "selectedCount": len(selected_apps),
-            "detectedCount": reachable,
+            "detectedCount": detected,
             "detectionComplete": detection_complete,
             "apps": apps,
-            "enabledServices": list(self.enabled_modules),
+            "enabledServices": list(selected_modules),
+            "activeEnabledServices": list(self.enabled_modules),
             "modules": [
-                {**module.public(), "enabled": module.id in self.enabled_modules}
+                public_module(module)
                 for module in SERVICE_MODULES if module.id != "umbrelarr"
             ],
-            "profiles": [profile.public() for profile in STACK_PROFILES],
-            "vpnProvider": self.vpn_provider.id,
+            "docker": {
+                "configured": bool(self.settings.docker_broker_url),
+                "available": bool(container_updated_at and not container_error),
+                "updatedAt": container_updated_at,
+                "error": container_error,
+            },
+            "vpnProvider": provider.id,
             "vpnProviders": [provider.public() for provider in VPN_PROVIDERS.values()],
             "vpnStatus": vpn_status,
             "configurationChanged": self._selection_dirty,
         }
 
-    def _vpn_setup_status(self):
-        if self.vpn_provider.service_id:
+    def _vpn_setup_status(self, provider=None):
+        provider = provider or self.vpn_provider
+        if provider.service_id:
             return {
                 "ready": True,
                 "status": "managed_app",
-                "detail": f"{self.vpn_provider.name} health and login are managed after connection",
+                "detail": f"{provider.name} health and login are managed after connection",
             }
         try:
-            status, detail = self.vpn_provider.check(self.settings, self.client)
+            status, detail = provider.check(self.settings, self.client)
         except (RequestError, OSError, ValueError) as error:
             status, detail = "waiting", self._safe_error(error)
         return {"ready": status == "healthy", "status": status, "detail": detail}
@@ -337,7 +597,18 @@ class Reconciler:
         }
         if MODULE_CATALOG_MARKER_TAG not in labels:
             # Migration path for 1.1: absence of the modular marker means the
-            # complete legacy stack remains selected with Privado.
+            # complete legacy stack remains selected with Privado unless the
+            # deployment already supplied explicit module/provider defaults.
+            selected = (
+                self.settings.enabled_modules
+                if self.settings.modules_configured else DEFAULT_MODULES
+            )
+            provider_id = (
+                self.settings.vpn_provider_id
+                if self.settings.modules_configured or self.settings.vpn_provider_configured
+                else "privado"
+            )
+            self._set_modules(selected, provider_id)
             return
         selected = {
             label.removeprefix(MODULE_MARKER_PREFIX)
@@ -353,6 +624,8 @@ class Reconciler:
         try:
             self._set_modules(selected, provider_id)
             self._selection_dirty = False
+            self._draft_modules = None
+            self._draft_vpn_provider_id = ""
         except ValueError:
             # Invalid or stale API markers never authorize a surprise module
             # change. Keep the environment/default selection visible instead.
@@ -376,58 +649,566 @@ class Reconciler:
             or label.startswith(MODULE_MARKER_PREFIX)
             or label.startswith(VPN_PROVIDER_MARKER_PREFIX)
         )
-        for label, item in existing.items():
-            if managed(label) and label not in desired:
-                self.client.json("DELETE", f"{api}/tag/{item['id']}", key)
+        # Create replacement markers before removing old ones. This keeps the
+        # previous selection authoritative if Prowlarr rejects the first write,
+        # and is especially important when changing VPN providers.
         for label in sorted(desired):
             if label not in existing:
                 self.client.json("POST", f"{api}/tag", key, {"label": label})
+        for label, item in existing.items():
+            if managed(label) and label not in desired:
+                self.client.json("DELETE", f"{api}/tag/{item['id']}", key)
 
-    def detect_apps(self):
-        selected_apps = self._selected_apps()
+    def refresh_container_state(self):
+        """Single-flight a broker refresh across telemetry and setup requests."""
+        if not self.settings.docker_broker_url:
+            return False
+        with self._container_refresh_lock:
+            return self._refresh_container_state_locked()
+
+    def _refresh_container_state_locked(self):
+        """Refresh sanitized container inventory and metrics from the host broker."""
+        if not self.settings.docker_broker_url:
+            return False
+        headers = {"Accept": "application/json"}
+        if self.settings.docker_broker_token:
+            headers["Authorization"] = f"Bearer {self.settings.docker_broker_token}"
+        try:
+            snapshot = self.client.json(
+                "GET",
+                f"{self.settings.docker_broker_url}/v1/snapshot",
+                headers=headers,
+            )
+            if not isinstance(snapshot, dict) or not isinstance(snapshot.get("services"), dict):
+                raise ValueError("Docker inventory returned an invalid snapshot")
+            updated_at = snapshot.get("updatedAt") or int(time.time())
+            if not isinstance(updated_at, (int, float, str)):
+                raise ValueError("Docker inventory returned an invalid timestamp")
+            services = {
+                slug: copy.deepcopy(value)
+                for slug, value in snapshot["services"].items()
+                if slug in NAMES and isinstance(value, dict)
+            }
+        except (RequestError, OSError, TypeError, ValueError) as error:
+            with self._setup_lock:
+                self._container_error = self._safe_error(error)
+            self._apply_container_snapshot()
+            return False
+        with self._setup_lock:
+            self._container_services = services
+            self._container_updated_at = updated_at
+            self._container_error = ""
+        self._apply_container_snapshot()
+        return True
+
+    def _apply_container_snapshot(self):
+        runtime = getattr(self, "runtime", None)
+        if runtime is None:
+            return
+        with self._setup_lock:
+            services = copy.deepcopy(self._container_services)
+            updated_at = self._container_updated_at
+            error = self._container_error
+        authoritative = bool(updated_at and not error)
+        for slug in tuple(runtime.services):
+            if self.settings.docker_broker_url and not authoritative:
+                container = {
+                    "state": "unknown",
+                    "health": "unknown",
+                    "updatedAt": updated_at,
+                }
+                if error:
+                    container["error"] = error
+                runtime.set_container(slug, container)
+                runtime.retain_resources(slug)
+                continue
+            value = services.get(slug)
+            if value is None:
+                container = {}
+                if self.settings.docker_broker_url:
+                    container = {
+                        "state": "unknown" if error else "not_installed",
+                        "health": "unknown",
+                        "updatedAt": updated_at,
+                    }
+                    if error:
+                        container["error"] = error
+                runtime.set_container(slug, container)
+                runtime.set_resources(slug, {})
+                continue
+            container = {
+                key: value[key]
+                for key in ("id", "containerId", "name", "state", "health")
+                if key in value
+            }
+            container["updatedAt"] = updated_at
+            runtime.set_container(slug, container)
+            resources = self._docker_resources(value, updated_at)
+            if not resources:
+                runtime.retain_resources(slug)
+                continue
+            runtime.set_resources(slug, resources)
+
+    @staticmethod
+    def _docker_resources(container, updated_at, sample_state="current"):
+        raw = container.get("resources")
+        if not isinstance(raw, dict):
+            return {}
+        memory = raw.get("memory") if isinstance(raw.get("memory"), dict) else {}
+        block_io = raw.get("blockIO") if isinstance(raw.get("blockIO"), dict) else {}
+        network = raw.get("network") if isinstance(raw.get("network"), dict) else {}
+        cpu = {}
+        if raw.get("cpuPercent") is not None:
+            cpu = {
+                "percent": raw.get("cpuPercent"),
+                "onlineCpus": raw.get("onlineCpus"),
+                "capacityPercent": raw.get("cpuCapacityPercent"),
+            }
+        if not any((cpu, memory, block_io, network)):
+            return {}
+        resources = {
+            "source": "docker",
+            "updatedAt": updated_at,
+            "sampleState": sample_state,
+        }
+        if cpu:
+            resources["cpu"] = cpu
+        if memory:
+            resources["memory"] = copy.deepcopy(memory)
+        if block_io:
+            resources["blockIo"] = copy.deepcopy(block_io)
+        if network:
+            resources["network"] = copy.deepcopy(network)
+        return resources
+
+    def dashboard_snapshot(self):
+        """Return only services backed by local discovery or explicit connections."""
+        snapshot = self.runtime.snapshot()
+        with self._setup_lock:
+            containers = copy.deepcopy(self._container_services)
+            updated_at = self._container_updated_at
+            error = self._container_error
+        docker_configured = bool(self.settings.docker_broker_url)
+        docker_available = bool(docker_configured and updated_at and not error)
+        runtime_services = {item["id"]: item for item in snapshot["services"]}
+
+        if docker_configured:
+            visible_ids = set(containers)
+            visible_ids.update(
+                slug for slug in runtime_services
+                if self.settings.runtime_url_is_configured(slug)
+            )
+            visible_ids.add("umbrelarr")
+        else:
+            visible_ids = {"umbrelarr"}
+            visible_ids.update(
+                slug for slug in runtime_services
+                if self.settings.url_is_configured(slug)
+            )
+
+        services = []
+        for module in SERVICE_MODULES:
+            slug = module.id
+            if slug not in visible_ids:
+                continue
+            if slug in runtime_services:
+                service = copy.deepcopy(runtime_services[slug])
+                service["managed"] = True
+                service["discoverySource"] = (
+                    "docker" if slug in containers else
+                    "direct" if self.settings.url_is_configured(slug) else
+                    "process"
+                )
+                services.append(service)
+                continue
+            container = containers.get(slug)
+            if not isinstance(container, dict):
+                continue
+            container_state = {
+                key: container[key]
+                for key in ("id", "containerId", "name", "state", "health")
+                if key in container
+            }
+            container_state["updatedAt"] = updated_at
+            sample_state = "current" if docker_available else "last_sample"
+            services.append({
+                "id": slug,
+                "name": module.name,
+                "role": module.role,
+                "status": "unknown",
+                "detail": "Installed locally and available to manage",
+                "link": self.settings.url(slug),
+                "checked_at": 0,
+                "checks": [],
+                "container": container_state,
+                "resources": self._docker_resources(
+                    container, updated_at, sample_state,
+                ),
+                "dependencies": [],
+                "waitingOn": [],
+                "managed": False,
+                "discoverySource": "docker",
+            })
+
+        counts = {state: 0 for state in VALID_STATES}
+        for service in services:
+            counts[service["status"]] += 1
+        snapshot["services"] = services
+        snapshot["counts"] = counts
+        snapshot["inventory"] = {
+            "mode": "docker" if docker_configured else "direct",
+            "configured": docker_configured,
+            "available": docker_available,
+            "updatedAt": updated_at,
+            "error": error,
+            "discoveredCount": len(containers),
+        }
+        return snapshot
+
+    def _container_inventory(self):
+        with self._setup_lock:
+            services = copy.deepcopy(self._container_services)
+            updated_at = self._container_updated_at
+            error = self._container_error
+            if not updated_at or error:
+                services = {}
+            return (
+                services,
+                updated_at,
+                error,
+            )
+
+    def detect_apps(self, selected_modules=None):
+        selected_modules = selected_modules or self._draft_modules or self.enabled_modules
+        selected_apps = tuple(
+            slug for slug in NAMES
+            if slug != "umbrelarr" and slug in selected_modules
+        )
+        containers = None
+        inventory_error = ""
+        if self.settings.docker_broker_url:
+            self.refresh_container_state()
+            containers, _updated_at, inventory_error = self._container_inventory()
         with ThreadPoolExecutor(max_workers=min(8, max(1, len(selected_apps)))) as executor:
-            apps = list(executor.map(self._detect_app, selected_apps))
+            futures = [
+                executor.submit(self._detect_app, slug, containers, inventory_error)
+                for slug in selected_apps
+            ]
+            apps = [future.result() for future in futures]
         with self._setup_lock:
             self._setup_detection = apps
-        self.runtime.event(f"Detected {sum(item['reachable'] for item in apps)} of {len(apps)} installed Umbrel Arr apps")
+        self.runtime.event(f"Detected {sum(item['detected'] for item in apps)} of {len(apps)} installed services")
         return self.setup_snapshot()
 
-    def select_and_detect(self, enabled_services, vpn_provider):
+    def select_and_detect(self, enabled_services, vpn_provider, connections=None):
         selected = normalize_modules(
             self.enabled_modules if enabled_services is None else enabled_services
         )
-        provider = get_vpn_provider(vpn_provider or self.vpn_provider.id)
+        if vpn_provider:
+            provider = get_vpn_provider(vpn_provider)
+        elif "privado-vpn" in selected:
+            provider = get_vpn_provider("privado")
+        elif self.vpn_provider.id == "privado":
+            provider = get_vpn_provider("direct")
+        else:
+            provider = self.vpn_provider
         selected = normalize_modules(
             (set(selected) - {"privado-vpn"}) | ({provider.service_id} if provider.service_id else set())
         )
         errors = validate_modules(selected)
         if errors:
             raise ValueError("; ".join(errors))
-        was_ready = self.ensure_setup_ready()
         changed = selected != self.enabled_modules or provider.id != self.vpn_provider.id
-        self._set_modules(selected, provider.id)
-        self._selection_dirty = was_ready and changed
-        self._setup_detection = []
-        self._mark_setup_required()
-        return self.detect_apps()
+        with self._setup_lock:
+            if connections is not None and self._draft_connection_restore is None:
+                self._draft_connection_restore = self.settings.connection_overrides()
+            connections_changed = self.settings.apply_connections(connections, selected)
+            self._draft_modules = selected if changed else None
+            self._draft_vpn_provider_id = provider.id if changed else ""
+            self._selection_dirty = changed or connections_changed
+            self._setup_detection = []
+        return self.detect_apps(selected)
 
-    def _detect_app(self, slug):
+    def cancel_selection_change(self):
+        with self._setup_lock:
+            if self._draft_connection_restore is not None:
+                self.settings.restore_connection_overrides(self._draft_connection_restore)
+            self._draft_connection_restore = None
+            self._draft_modules = None
+            self._draft_vpn_provider_id = ""
+            self._selection_dirty = False
+            self._setup_detection = []
+        return self.setup_snapshot()
+
+    def bootstrap_credential(self, service_id, username, password):
+        """Create a dedicated credential through an explicitly authorized service API."""
+        if service_id != "jellyfin":
+            raise ValueError("Automatic credential creation is supported only for Jellyfin")
+        username = str(username or "").strip()
+        password = str(password or "")
+        if not username or len(username) > 128 or any(ord(character) < 32 for character in username):
+            raise ValueError("Enter a valid Jellyfin administrator username")
+        if not password or len(password) > 512 or "\x00" in password:
+            raise ValueError("Enter the Jellyfin administrator password")
+
+        with self._setup_lock:
+            selected = self._draft_modules or self.enabled_modules
+            detected = next(
+                (dict(item) for item in self._setup_detection if item.get("id") == service_id),
+                None,
+            )
+        if service_id not in selected:
+            raise ValueError("Choose Jellyfin before creating its API key")
+        if detected is None:
+            raise ValueError("Check Jellyfin before creating its API key")
+        if not detected.get("reachable"):
+            raise ValueError("Jellyfin must be reachable before creating its API key")
+        metadata = self.settings.credential_metadata(service_id)
+        if metadata["environmentCredentialConfigured"]:
+            variable = metadata["apiKeyEnvironmentVariable"]
+            raise ValueError(
+                f"{variable} is configured but was rejected. Replace or remove it and restart umbrelarr before creating another key."
+            )
+        if detected.get("credentials") or detected.get("action") != "create_api_key":
+            raise ValueError("Jellyfin does not currently need a new API key")
+
+        url = self.settings.url(service_id).rstrip("/")
+        client_header = (
+            'MediaBrowser Client="umbrelarr", Device="umbrelarr", '
+            'DeviceId="umbrelarr-setup", Version="1.0"'
+        )
+        admin_token = ""
+        api_key = ""
+        try:
+            try:
+                authentication = self.client.json(
+                    "POST",
+                    f"{url}/Users/AuthenticateByName",
+                    payload={"Username": username, "Pw": password},
+                    headers={"Authorization": client_header},
+                )
+            except RequestError as error:
+                if error.status in {401, 403}:
+                    raise ValueError("Jellyfin rejected the administrator username or password") from None
+                raise RuntimeError("Jellyfin could not authenticate the administrator account") from None
+            if not isinstance(authentication, dict):
+                raise RuntimeError("Jellyfin returned an invalid authentication response")
+            admin_token = ApiKeyResolver._clean(
+                authentication.get("AccessToken", authentication.get("accessToken", ""))
+            )
+            if not admin_token:
+                raise RuntimeError("Jellyfin did not return an administrator session")
+            admin_headers = {"X-Emby-Token": admin_token}
+
+            try:
+                user = self.client.json("GET", f"{url}/Users/Me", headers=admin_headers)
+            except RequestError as error:
+                if error.status in {401, 403}:
+                    raise ValueError("Jellyfin did not grant administrator access") from None
+                raise RuntimeError("Jellyfin could not verify administrator access") from None
+            user = user if isinstance(user, dict) else {}
+            policy = user.get("Policy", user.get("policy", {}))
+            is_administrator = isinstance(policy, dict) and bool(
+                policy.get("IsAdministrator", policy.get("isAdministrator", False))
+            )
+            if not is_administrator:
+                raise ValueError("Use a Jellyfin administrator account to create the API key")
+
+            def named_keys():
+                try:
+                    result = self.client.json("GET", f"{url}/Auth/Keys", headers=admin_headers)
+                except RequestError as error:
+                    if error.status in {401, 403}:
+                        raise ValueError("Jellyfin did not grant API-key administration access") from None
+                    raise RuntimeError("Jellyfin could not list its API keys") from None
+                if isinstance(result, dict):
+                    items = result.get("Items", result.get("items", []))
+                elif isinstance(result, list):
+                    items = result
+                else:
+                    items = []
+                matches = []
+                for item in items if isinstance(items, list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get(
+                        "Name",
+                        item.get("name", item.get("AppName", item.get("appName", ""))),
+                    )
+                    if str(name).strip().casefold() == "umbrelarr":
+                        matches.append(item)
+                return matches
+
+            matches = named_keys()
+            if len(matches) > 1:
+                raise ValueError(
+                    "Jellyfin has multiple API keys named umbrelarr. Remove the duplicates in Jellyfin and try again."
+                )
+            if not matches:
+                try:
+                    self.client.json(
+                        "POST",
+                        f"{url}/Auth/Keys?{urlencode({'app': 'umbrelarr'})}",
+                        headers=admin_headers,
+                    )
+                except RequestError as error:
+                    if error.status in {401, 403}:
+                        raise ValueError("Jellyfin did not grant API-key creation access") from None
+                    raise RuntimeError("Jellyfin could not create the dedicated API key") from None
+                matches = named_keys()
+            if len(matches) != 1:
+                raise RuntimeError("Jellyfin did not return the dedicated umbrelarr API key")
+            api_key = ApiKeyResolver._clean(
+                matches[0].get(
+                    "AccessToken",
+                    matches[0].get("accessToken", matches[0].get("Key", matches[0].get("key", ""))),
+                )
+            )
+            if not api_key:
+                raise RuntimeError("Jellyfin returned an invalid dedicated API key")
+            try:
+                self.client.json(
+                    "GET", f"{url}/System/Info", headers={"X-Emby-Token": api_key},
+                )
+            except RequestError:
+                raise ValueError(
+                    "Jellyfin rejected the dedicated umbrelarr API key. Revoke it in Jellyfin and try again."
+                ) from None
+            self.settings.set_runtime_key(service_id, api_key, "service_api")
+        finally:
+            if admin_token:
+                try:
+                    self.client.json(
+                        "POST", f"{url}/Sessions/Logout",
+                        headers={"X-Emby-Token": admin_token},
+                    )
+                except (RequestError, OSError, ValueError):
+                    pass
+
+        self.runtime.event("Jellyfin API key connected through its administrator API")
+        return self.detect_apps(selected)
+
+    def remove_service(self, slug):
+        module = MODULES.get(slug)
+        if module is None:
+            raise ValueError("Choose a known managed service")
+        if module.required:
+            raise ValueError(f"{module.name} is required by umbrelarr and cannot be removed")
+        if not self.ensure_setup_ready():
+            raise RuntimeError("Complete explicit setup before removing managed services")
+        if slug not in self.enabled_modules:
+            # Removing an already-absent service is intentionally idempotent.
+            return self.setup_snapshot()
+
+        selected = normalize_modules(set(self.enabled_modules) - {slug})
+        provider_id = "direct" if self.vpn_provider.service_id == slug else self.vpn_provider.id
+        errors = validate_modules(selected)
+        if errors:
+            raise ValueError(
+                f"Cannot remove {module.name}: {'; '.join(errors)}. "
+                "Remove the dependent service first."
+            )
+
+        # Prowlarr is the durable source of truth. Do not change the active
+        # runtime until its markers accept the new selection.
+        try:
+            self._replace_module_markers(selected, provider_id)
+        except (RequestError, OSError) as error:
+            raise RuntimeError(
+                "Unable to save the managed service selection in Prowlarr: "
+                f"{self._safe_error(error)}"
+            ) from error
+        self._set_modules(selected, provider_id)
+        self.settings.clear_runtime_connection(slug)
+        with self._setup_lock:
+            self._selection_dirty = False
+            self._draft_modules = None
+            self._draft_vpn_provider_id = ""
+            self._draft_connection_restore = None
+            self._setup_detection = []
+        self.runtime.event(
+            f"Stopped managing {module.name}; the installed app and its settings were left unchanged"
+        )
+        self.reconcile_async()
+        return self.setup_snapshot()
+
+    def _detect_app(self, slug, containers=None, inventory_error=""):
+        container = None
+        if containers is not None:
+            if inventory_error:
+                return {
+                    "id": slug,
+                    "name": NAMES[slug],
+                    "reachable": False,
+                    "credentials": False,
+                    "action": "docker_unavailable",
+                    "detected": False,
+                    "detail": f"Docker inventory is unavailable: {inventory_error}",
+                    "link": self.settings.url(slug),
+                    "container": {"state": "unknown", "health": "unknown"},
+                }
+            value = containers.get(slug)
+            if value is None:
+                return {
+                    "id": slug,
+                    "name": NAMES[slug],
+                    "reachable": False,
+                    "credentials": False,
+                    "action": "install_or_start",
+                    "detected": False,
+                    "detail": "Service is not installed",
+                    "link": self.settings.url(slug),
+                    "container": {"state": "not_installed", "health": "unknown"},
+                }
+            container = {
+                key: value[key]
+                for key in ("id", "containerId", "name", "state", "health")
+                if key in value
+            }
+            state = str(container.get("state", "unknown")).casefold()
+            if state != "running":
+                return {
+                    "id": slug,
+                    "name": NAMES[slug],
+                    "reachable": False,
+                    "credentials": False,
+                    "action": "start_service",
+                    "detected": True,
+                    "detail": f"App is installed but its container is {state.replace('_', ' ')}",
+                    "link": self.settings.url(slug),
+                    "container": container,
+                }
         url = self.settings.url(slug)
         reachable = False
         probe_succeeded = False
-        detail = "No configured service address"
+        credential_action = ""
+        detail = "App was not reachable"
         if url:
             try:
                 probes = {
                     "qbittorrent": "/api/v2/app/version",
                     "jellyfin": "/System/Info/Public",
                     "plex": "/identity",
+                    "privado-vpn": "/api/status",
+                    "profilarr": "/api/v1/status",
+                    "overseerr": "/api/v1/settings/public",
                 }
                 probe = f"{url}{probes.get(slug, '/')}"
-                self.client.request("GET", probe, timeout=3)
+                response = self.client.request("GET", probe, timeout=3)
                 reachable = True
-                probe_succeeded = True
-                detail = "Installed app is reachable"
+                redirected = urlsplit(getattr(response, "url", "") or probe)
+                if (
+                    redirected.hostname == urlsplit(self.settings.external_url(slug)).hostname
+                    and redirected.port == 2000
+                ):
+                    credential_action = "direct_connection_required"
+                    detail = (
+                        "This address opens a platform login instead of the service API. "
+                        "Enter a direct service address and check again."
+                    )
+                else:
+                    probe_succeeded = True
+                    detail = "Installed app is reachable"
             except RequestError as error:
                 if error.status is not None:
                     reachable = True
@@ -443,46 +1224,134 @@ class Reconciler:
                 detail = "Enter qBittorrent's one-time password when confirming setup"
         else:
             credentials = slug not in KEYED_APPS or bool(self.settings.key(slug))
+        if credential_action == "direct_connection_required":
+            credentials = False
+        if reachable and credentials and slug != "qbittorrent":
+            try:
+                self._validate_detected_connection(slug)
+            except RequestError as error:
+                credentials = False
+                if error.status in {401, 403}:
+                    credential_action = "invalid_credentials"
+                    detail = (
+                        "The API key was rejected. Enter a current key and check again"
+                    )
+                elif error.status is None:
+                    reachable = False
+                    detail = "App stopped responding during its connection check"
+                else:
+                    credential_action = "connection_error"
+                    detail = f"Connection check failed: {self._safe_error(error)}"
+            except (OSError, ValueError) as error:
+                credentials = False
+                credential_action = "connection_error"
+                detail = f"Connection check failed: {self._safe_error(error)}"
+        if reachable and credentials and slug in KEYED_APPS:
+            source = self.settings.credential_metadata(slug)["credentialSource"]
+            if source == "managed_config":
+                detail = (
+                    "Existing Plex token connected automatically"
+                    if slug == "plex" else
+                    "API key connected automatically from the installed app"
+                )
+            elif source == "service_api":
+                detail = "Dedicated umbrelarr API key created and verified"
+            elif source == "environment":
+                detail = "Environment API key verified"
+            elif source == "ui":
+                detail = "UI-provided API key verified for this process"
         if reachable and not credentials and slug != "qbittorrent":
-            if slug == "jellyfin":
-                detail = "Create a Jellyfin API key named umbrelarr, then restart umbrelarr"
+            if credential_action:
+                pass
+            elif slug == "jellyfin":
+                detail = "Create and connect a dedicated Jellyfin API key with an administrator account"
             elif slug == "plex":
-                detail = "Claim or sign in to this Plex server, then restart umbrelarr"
+                detail = "Claim or sign in to this Plex server, then enter its token above"
+            elif slug == "overseerr":
+                detail = "Complete Plex sign-in in Overseerr, then enter its API key above"
+            elif MODULES[slug].credential_setup == "generated":
+                detail = (
+                    "The app has not exposed its generated API key yet. Wait for it to finish starting, "
+                    "or provide the key through an environment variable or the UI"
+                )
             else:
                 detail = (
-                    "Installed app found; waiting for its API key. Restart umbrelarr "
-                    "if this app was installed after umbrelarr started"
+                    "Service found. Enter its API key above and check again"
                 )
         action = "none"
         if not reachable:
-            action = "install_or_start"
+            action = "connection_error" if container else "install_or_start"
         elif not credentials:
             actions = {
                 "qbittorrent": "temporary_password_required",
                 "jellyfin": "create_api_key",
                 "plex": "claim_server",
+                "overseerr": "complete_sign_in",
             }
-            action = actions.get(slug, "wait_for_api_key")
+            action = credential_action or actions.get(slug, "wait_for_api_key")
         return {
             "id": slug,
             "name": NAMES[slug],
             "reachable": reachable,
             "credentials": credentials,
             "action": action,
-            "detected": reachable,
+            "detected": bool(container) if containers is not None else reachable,
             "detail": detail,
-            "link": self.settings.external_url(slug),
+            "link": self.settings.url(slug),
+            "container": container or {},
         }
+
+    def _validate_detected_connection(self, slug):
+        """Validate an existing connection using read-only service APIs."""
+        key = self.settings.key(slug)
+        if slug in {arr.slug for arr in self._arr_instances()}:
+            arr = next(arr for arr in self._arr_instances() if arr.slug == slug)
+            self.client.json("GET", f"{arr.api}/system/status", key)
+        elif slug == "prowlarr":
+            self.client.json(
+                "GET", f"{self.settings.url(slug)}/api/v1/system/status", key,
+            )
+        elif slug == "sabnzbd":
+            query = urlencode({"mode": "version", "apikey": key, "output": "json"})
+            parsed = urlsplit(self.settings.url(slug))
+            trusted_host = "localhost" if parsed.port is None else f"localhost:{parsed.port}"
+            self.client.request(
+                "GET", f"{self.settings.url(slug)}/api?{query}",
+                headers={"Host": trusted_host}, timeout=5,
+            )
+        elif slug == "bazarr":
+            self.client.json(
+                "GET", f"{self.settings.url(slug)}/api/system/status", key,
+            )
+        elif slug == "jellyfin":
+            self.client.json(
+                "GET", f"{self.settings.url(slug)}/System/Info",
+                headers={"X-Emby-Token": key},
+            )
+        elif slug == "plex":
+            self.client.json(
+                "GET", f"{self.settings.url(slug)}/library/sections",
+                headers={"X-Plex-Token": key},
+            )
+        elif slug == "overseerr":
+            self.client.json(
+                "GET", f"{self.settings.url(slug)}/api/v1/settings/main",
+                headers={"X-API-Key": key},
+            )
 
     def confirm_setup(
         self, storage_mode="", root_ids=None,
         qbittorrent_username="admin", qbittorrent_temporary_password="",
         enabled_services=None, vpn_provider="",
     ):
+        was_ready = self.ensure_setup_ready()
+        with self._setup_lock:
+            expected_modules = self._draft_modules or self.enabled_modules
+            expected_provider_id = self._draft_vpn_provider_id or self.vpn_provider.id
         selected = normalize_modules(
-            self.enabled_modules if enabled_services is None else enabled_services
+            expected_modules if enabled_services is None else enabled_services
         )
-        provider_id = vpn_provider or self.vpn_provider.id
+        provider_id = vpn_provider or expected_provider_id
         provider = get_vpn_provider(provider_id)
         selected = normalize_modules(
             (set(selected) - {"privado-vpn"}) | ({provider.service_id} if provider.service_id else set())
@@ -490,28 +1359,49 @@ class Reconciler:
         errors = validate_modules(selected)
         if errors:
             raise ValueError("; ".join(errors))
-        if selected != self.enabled_modules or provider_id != self.vpn_provider.id:
-            self._set_modules(selected, provider_id)
-            self._setup_detection = []
+        if selected != expected_modules or provider_id != expected_provider_id:
             raise ValueError("Module selection changed; run detection again before connecting apps")
-        snapshot = self.setup_snapshot()
+        snapshot = (
+            self.detect_apps(selected)
+            if self.settings.docker_broker_url
+            else self.setup_snapshot()
+        )
+        if self.settings.docker_broker_url and not snapshot["docker"]["available"]:
+            detail = snapshot["docker"].get("error") or "no current snapshot"
+            raise ValueError(f"Docker inventory is unavailable: {detail}")
         if not snapshot["detectionComplete"]:
             raise ValueError("Detect installed apps before connecting them")
         missing = [item["name"] for item in snapshot["apps"] if not item["reachable"]]
         if missing:
             raise ValueError(f"Install or start these required apps first: {', '.join(missing)}")
-        missing_keys = [
+        connection_issues = [
             item["name"] for item in snapshot["apps"]
             if item["id"] != "qbittorrent" and not item["credentials"]
         ]
-        if missing_keys:
-            raise ValueError(f"Wait for these apps to generate API credentials: {', '.join(missing_keys)}")
+        if connection_issues:
+            raise ValueError(
+                "Resolve these service connections before applying: "
+                + ", ".join(connection_issues)
+            )
         if not snapshot["vpnStatus"]["ready"]:
             raise ValueError(snapshot["vpnStatus"]["detail"])
-        if self.arrs and not storage_mode:
-            raise ValueError("Choose local, network, or existing library roots before confirming setup")
-        if self.arrs:
-            self._validate_storage_selection(storage_mode, root_ids or {})
+        selected_arrs = [
+            arr for arr in self._arr_instances()
+            if arr.slug in selected
+        ]
+        if selected_arrs and not storage_mode:
+            detected_storage = self.storage_snapshot()
+            detected_mode = detected_storage.get("mode")
+            if detected_storage.get("actionRequired") or detected_mode not in {*PRESETS, "adopted"}:
+                storage_mode = "local"
+                root_ids = {}
+            else:
+                storage_mode = "adopt" if detected_mode == "adopted" else detected_mode
+                root_ids = detected_storage.get("rootIds", {})
+        if selected_arrs:
+            self._validate_storage_selection(
+                storage_mode, root_ids or {}, selected, selected_arrs,
+            )
         key = self.settings.key("prowlarr")
         api = f"{self.settings.url('prowlarr')}/api/v1"
         tags = self.client.json("GET", f"{api}/tag", key)
@@ -523,17 +1413,45 @@ class Reconciler:
             self.client.json("POST", f"{api}/tag", key, {"label": SETUP_MARKER_TAG})
         with self._setup_lock:
             self._setup_complete = True
-        self._replace_module_markers(selected, provider_id)
-        if "qbittorrent" in self.enabled_modules:
-            self._onboard_qbittorrent(qbittorrent_username, qbittorrent_temporary_password)
-        if self.arrs:
-            self._apply_storage(storage_mode, root_ids or {})
-        tags = self.client.json("GET", f"{api}/tag", key)
-        if not any(item.get("label", "").casefold() == SETUP_READY_MARKER_TAG for item in tags):
-            self.client.json("POST", f"{api}/tag", key, {"label": SETUP_READY_MARKER_TAG})
+        previous_modules = self.enabled_modules
+        previous_provider = self.vpn_provider
+        previous_runtime = self.runtime
+        previous_arrs = self.arrs
+        self._set_modules(selected, provider_id)
+        try:
+            # A first setup persists the reviewed selection immediately so an
+            # interrupted credential handoff can resume after a restart. A
+            # later fleet edit leaves the active markers untouched until every
+            # new connection has passed its apply step.
+            if not was_ready:
+                self._replace_module_markers(selected, provider_id)
+            if "qbittorrent" in self.enabled_modules:
+                self._onboard_qbittorrent(
+                    qbittorrent_username, qbittorrent_temporary_password,
+                )
+            if self.arrs:
+                self._apply_storage(storage_mode, root_ids or {})
+            if was_ready:
+                self._replace_module_markers(selected, provider_id)
+            tags = self.client.json("GET", f"{api}/tag", key)
+            if not any(item.get("label", "").casefold() == SETUP_READY_MARKER_TAG for item in tags):
+                self.client.json("POST", f"{api}/tag", key, {"label": SETUP_READY_MARKER_TAG})
+        except Exception:
+            if was_ready:
+                self.enabled_modules = previous_modules
+                self.vpn_provider = previous_provider
+                self.runtime = previous_runtime
+                self.arrs = previous_arrs
+                self.storage.set_enabled_modules(previous_modules)
+            else:
+                self._mark_setup_required()
+            raise
         with self._setup_lock:
             self._setup_ready = True
             self._selection_dirty = False
+            self._draft_modules = None
+            self._draft_vpn_provider_id = ""
+            self._draft_connection_restore = None
         self.runtime.event("Explicit setup completed; installed apps are now managed")
         self.reconcile_async()
         return self.setup_snapshot()
@@ -574,15 +1492,167 @@ class Reconciler:
         return "Library roots were derived from the managed Arr APIs"
 
     def storage_snapshot(self):
-        folders = self._read_root_folders(required=False)
+        with self._setup_lock:
+            selected = self._draft_modules or self.enabled_modules
+        selected_arrs = [
+            arr for arr in self._arr_instances()
+            if arr.slug in selected
+        ]
+        folders = self._read_root_folders(required=False, arrs=selected_arrs)
         mode, root_ids = self._storage_marker_selection(self._prowlarr_tags(required=False))
-        return self.storage.update_from_apis(folders, mode, root_ids)
+        if selected == self.enabled_modules:
+            target = self.storage
+        else:
+            target = StorageSettings()
+            target.set_enabled_modules(selected)
+        return target.update_from_apis(folders, mode, root_ids)
 
     def save_storage(self, mode, root_ids):
         if not self.ensure_setup_ready():
             raise RuntimeError("Complete explicit setup before changing library roots")
         snapshot = self._apply_storage(mode, root_ids)
         self.runtime.event(f"Library layout applied through service APIs for {mode} storage")
+        self.reconcile_async()
+        return snapshot
+
+    def browse_library_filesystem(self, library_key, path="/"):
+        if library_key not in LOCAL_ROOTS or library_key not in self.enabled_modules:
+            raise ValueError("Choose a managed media library")
+        arr = next(item for item in self.arrs if item.slug == library_key)
+        if not arr.url or not arr.api_key:
+            raise ValueError(f"{arr.name} API credentials are not available")
+        path = str(path or "/").strip() or "/"
+        if len(path) > 1024 or not Path(path).is_absolute():
+            raise ValueError("Choose an absolute folder path")
+        try:
+            values = self._filesystem_contents(arr, path)
+        except (RequestError, OSError) as error:
+            raise ValueError(
+                f"Unable to browse {arr.name}: {self._safe_error(error)}"
+            ) from error
+        if isinstance(values, dict):
+            directories = values.get("directories", values.get("Directories", []))
+            parent = values.get("parent", values.get("Parent"))
+        elif isinstance(values, list):
+            directories = values
+            parent = str(Path(path).parent) if path != "/" else None
+        else:
+            directories = []
+            parent = None
+        normalized = []
+        seen = set()
+        for item in directories if isinstance(directories, list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_path = str(item.get("path", item.get("Path", ""))).rstrip("/") or "/"
+            if not Path(item_path).is_absolute() or item_path in seen:
+                continue
+            seen.add(item_path)
+            normalized.append({
+                "name": str(item.get("name", item.get("Name", ""))) or Path(item_path).name or item_path,
+                "path": item_path,
+            })
+        normalized.sort(key=lambda item: item["name"].casefold())
+        parent = (str(parent).rstrip("/") or "/") if parent else None
+        mounts = self.library_mount_checks(path, {library_key: values})
+        return {
+            "path": path.rstrip("/") or "/",
+            "parent": parent,
+            "directories": normalized,
+            "service": arr.name,
+            "mounts": mounts,
+            "allMounted": bool(mounts) and all(item["status"] == "match" for item in mounts),
+        }
+
+    def _filesystem_contents(self, arr, path):
+        query = urlencode({
+            "path": path,
+            "includeFiles": "false",
+            "allowFoldersWithoutTrailingSlashes": "true",
+        })
+        return self.client.json("GET", f"{arr.api}/filesystem?{query}", arr.api_key)
+
+    def library_mount_checks(self, path, known=None):
+        path = str(path or "/").strip().rstrip("/") or "/"
+        if len(path) > 1024 or not Path(path).is_absolute():
+            raise ValueError("Choose an absolute folder path")
+        known = known or {}
+
+        def check(arr):
+            if not arr.url or not arr.api_key:
+                return {"id": arr.slug, "name": arr.name, "status": "unavailable", "detail": "API credentials unavailable"}
+            try:
+                if arr.slug not in known:
+                    self._filesystem_contents(arr, path)
+                return {"id": arr.slug, "name": arr.name, "status": "match", "detail": "Same path is available"}
+            except (RequestError, OSError, ValueError) as error:
+                return {"id": arr.slug, "name": arr.name, "status": "missing", "detail": self._safe_error(error)}
+
+        arrs = list(self.arrs)
+        if not arrs:
+            return []
+        with ThreadPoolExecutor(max_workers=len(arrs)) as executor:
+            return list(executor.map(check, arrs))
+
+    def save_library_storage(self, library_key, source, root_id=None, path=None):
+        if not self.ensure_setup_ready():
+            raise RuntimeError("Complete explicit setup before changing library roots")
+        if library_key not in LOCAL_ROOTS or library_key not in self.enabled_modules:
+            raise ValueError("Choose a managed media library")
+        if source not in {"local", "network", "existing", "custom"}:
+            raise ValueError("Library source must be Umbrel storage, network storage, or a system folder")
+
+        current = self.storage_snapshot()
+        if current["actionRequired"] or set(current["rootIds"]) != {
+            arr.slug for arr in self.arrs
+        }:
+            raise ValueError("Resolve every library root before changing an individual library")
+        selected_ids = dict(current["rootIds"])
+        arr = next(item for item in self.arrs if item.slug == library_key)
+
+        if source == "existing":
+            try:
+                selected_id = int(root_id)
+            except (TypeError, ValueError) as error:
+                raise ValueError("Choose an existing root for this library") from error
+            candidates = current["candidates"].get(library_key, [])
+            match = next((item for item in candidates if item["id"] == selected_id), None)
+            if match is None:
+                raise ValueError("The selected root is not available in this library's app")
+            selected_path = match["path"]
+        else:
+            if source == "local":
+                selected_path = LOCAL_ROOTS[library_key]
+            elif source == "network":
+                selected_path = NETWORK_ROOTS[library_key]
+            else:
+                selected_path = str(path or "").strip()
+                if not selected_path:
+                    raise ValueError("Choose a system folder for this library")
+                selected_path = selected_path.rstrip("/") or "/"
+
+        mount_checks = self.library_mount_checks(selected_path)
+        unmatched = [item["name"] for item in mount_checks if item["status"] != "match"]
+        if unmatched:
+            raise ValueError(
+                f"{selected_path} must be mounted at the same path in every managed media service; "
+                f"check {', '.join(unmatched)}"
+            )
+
+        if source != "existing":
+            self._ensure_root(arr, selected_path)
+            folders = self._read_root_folders(required=True, arrs=[arr])[library_key]
+            match = next(
+                (item for item in folders if str(item.get("path", "")).rstrip("/") == selected_path.rstrip("/")),
+                None,
+            )
+            if match is None or match.get("id") is None:
+                raise RuntimeError("The selected root was not accepted by the library app")
+            selected_id = int(match["id"])
+
+        selected_ids[library_key] = selected_id
+        snapshot = self._apply_storage("adopted", selected_ids)
+        self.runtime.event(f"{arr.name} library root updated through its service API")
         self.reconcile_async()
         return snapshot
 
@@ -618,26 +1688,26 @@ class Reconciler:
         self.arrs = [arr for arr in self._arr_instances() if arr.slug in self.enabled_modules]
         return snapshot
 
-    def _validate_storage_selection(self, mode, root_ids):
+    def _validate_storage_selection(self, mode, root_ids, enabled=None, arrs=None):
         normalized = "adopted" if mode == "adopt" else mode
         if normalized not in {*PRESETS, "adopted"}:
             raise ValueError("Storage mode must be local, network, or adopt")
         if normalized != "adopted":
             return
-        folders = self._read_root_folders(required=True)
+        folders = self._read_root_folders(required=True, arrs=arrs)
         cleaned_ids = {
             slug: int(value) for slug, value in root_ids.items()
             if slug in LOCAL_ROOTS and str(value).strip()
         }
         candidate_storage = StorageSettings()
-        candidate_storage.set_enabled_modules(self.enabled_modules)
+        candidate_storage.set_enabled_modules(enabled or self.enabled_modules)
         candidate = candidate_storage.update_from_apis(folders, "adopted", cleaned_ids)
         if candidate["actionRequired"]:
             raise ValueError("Choose one existing root-folder ID for every library")
 
-    def _read_root_folders(self, required):
+    def _read_root_folders(self, required, arrs=None):
         folders = {}
-        for arr in self.arrs:
+        for arr in self.arrs if arrs is None else arrs:
             if not arr.url or not arr.api_key:
                 if required:
                     raise ValueError(f"{arr.name} API credentials are not available")
@@ -950,10 +2020,11 @@ class Reconciler:
         suffix = f" and {', '.join(clients)}" if clients else ""
         return f"Root {arr.root}{suffix} are configured"
 
-    def _ensure_root(self, arr):
+    def _ensure_root(self, arr, root=None):
+        root = root or arr.root
         existing = self.client.json("GET", f"{arr.api}/rootfolder", arr.api_key)
-        if not any(item.get("path", "").rstrip("/") == arr.root.rstrip("/") for item in existing):
-            payload = {"path": arr.root}
+        if not any(item.get("path", "").rstrip("/") == root.rstrip("/") for item in existing):
+            payload = {"path": root}
             if arr.implementation == "Lidarr":
                 metadata_profiles = self.client.json("GET", f"{arr.api}/metadataprofile", arr.api_key)
                 quality_profiles = self.client.json("GET", f"{arr.api}/qualityprofile", arr.api_key)
@@ -967,7 +2038,7 @@ class Reconciler:
                     (item for item in quality_profiles if item.get("name") == "Any"),
                     quality_profiles[0],
                 )
-                payload["name"] = Path(arr.root).name.replace("-", " ").title() or "Music"
+                payload["name"] = Path(root).name.replace("-", " ").title() or "Music"
                 payload["defaultMetadataProfileId"] = metadata["id"]
                 payload["defaultQualityProfileId"] = quality["id"]
             self.client.json("POST", f"{arr.api}/rootfolder", arr.api_key, payload)
@@ -1358,3 +2429,14 @@ class ReconcileLoop:
             else:
                 self.reconciler._mark_setup_required()
             self.stop_event.wait(self.reconciler.settings.interval)
+
+
+class DockerTelemetryLoop:
+    def __init__(self, reconciler):
+        self.reconciler = reconciler
+        self.stop_event = threading.Event()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            self.reconciler.refresh_container_state()
+            self.stop_event.wait(self.reconciler.settings.telemetry_interval)

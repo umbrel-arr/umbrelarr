@@ -4,7 +4,8 @@ RUN addgroup -S -g 1000 umbrelarr \
     && adduser -S -D -H -u 1000 -G umbrelarr umbrelarr
 
 WORKDIR /app
-COPY app/api_keys.py app/app.py app/catalog.py app/dashboard.py app/http_client.py app/reconciler.py app/state.py app/storage.py app/vpn.py app/icon.png ./
+COPY app/api_keys.py app/app.py app/catalog.py app/dashboard.py app/docker_inventory.py app/http_client.py app/reconciler.py app/state.py app/storage.py app/vpn.py app/icon.png ./
+COPY app/service-icons ./service-icons
 
 ENV PORT=8080 PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 EXPOSE 8080

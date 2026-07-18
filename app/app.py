@@ -5,12 +5,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from dashboard import SERVICE_TITLES, render_page
-from reconciler import ReconcileLoop, Reconciler
+from dashboard import LIBRARY_TITLES, SERVICE_TITLES, render_page
+from reconciler import DockerTelemetryLoop, ReconcileLoop, Reconciler
 
 
 RECONCILER = Reconciler()
 ICON = Path(__file__).with_name("icon.png").read_bytes()
+SERVICE_ICON_DIR = Path(__file__).with_name("service-icons")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -28,7 +29,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionResetError):
+            # Navigation and image cancellation are normal browser behavior;
+            # do not turn them into noisy server tracebacks.
+            return
 
     def send_json(self, status, value):
         self.send_body(status, "application/json", json.dumps(value))
@@ -46,31 +52,48 @@ class Handler(BaseHTTPRequestHandler):
         pages = {
             "/": "overview",
             "/index.html": "overview",
-            "/setup": "setup",
             "/services": "services",
-            "/dependencies": "dependencies",
             "/libraries": "libraries",
             "/activity": "activity",
         }
+        if path in {"/setup", "/dependencies"}:
+            return self.send_redirect("/services")
         if path in pages:
-            values = parse_qs(target.query)
-            mode = values.get("mode", ["basic"])[0]
-            return self.send_body(200, "text/html; charset=utf-8", render_page(pages[path], mode))
+            return self.send_body(200, "text/html; charset=utf-8", render_page(pages[path]))
         if path == "/settings/media":
-            suffix = f"?{target.query}" if target.query else ""
-            return self.send_redirect(f"/libraries{suffix}")
+            return self.send_redirect("/libraries")
+        if path.startswith("/libraries/"):
+            library_id = path.removeprefix("/libraries/").strip("/")
+            if library_id in LIBRARY_TITLES:
+                return self.send_body(200, "text/html; charset=utf-8", render_page("library", library_id=library_id))
         if path.startswith("/services/"):
             service_id = path.removeprefix("/services/").strip("/")
             if service_id in SERVICE_TITLES:
-                return self.send_body(200, "text/html; charset=utf-8", render_page("service", service_id=service_id))
+                return self.send_redirect("/services")
         if path == "/icon.png":
             return self.send_body(200, "image/png", ICON)
+        if path.startswith("/service-icons/") and path.endswith(".svg"):
+            service_id = path.removeprefix("/service-icons/").removesuffix(".svg")
+            if service_id in SERVICE_TITLES:
+                icon = SERVICE_ICON_DIR / f"{service_id}.svg"
+                if icon.is_file():
+                    return self.send_body(200, "image/svg+xml", icon.read_bytes())
         if path == "/api/status":
-            return self.send_json(200, RECONCILER.runtime.snapshot())
+            return self.send_json(200, RECONCILER.dashboard_snapshot())
         if path == "/api/setup":
             return self.send_json(200, RECONCILER.setup_snapshot())
         if path == "/api/storage":
             return self.send_json(200, RECONCILER.storage_snapshot())
+        if path == "/api/storage/browse":
+            values = parse_qs(target.query, keep_blank_values=True)
+            try:
+                result = RECONCILER.browse_library_filesystem(
+                    values.get("libraryKey", [""])[0],
+                    values.get("path", ["/"])[0],
+                )
+                return self.send_json(200, result)
+            except (ValueError, RuntimeError) as error:
+                return self.send_json(400, {"error": RECONCILER._safe_error(error)})
         if path == "/healthz":
             return self.send_json(200, {"ok": True})
         return self.send_json(404, {"error": "Not found"})
@@ -87,6 +110,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/setup/detect":
                 values = self._form()
                 raw_services = values.get("enabledServices", [""])[0]
+                raw_connections = values.get("connections", ["{}"])[0]
+                try:
+                    connections = json.loads(raw_connections or "{}")
+                except json.JSONDecodeError as error:
+                    raise ValueError("connections must be a JSON object") from error
+                if not isinstance(connections, dict):
+                    raise ValueError("connections must be a JSON object")
                 if raw_services:
                     try:
                         enabled_services = json.loads(raw_services)
@@ -97,8 +127,16 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_json(200, RECONCILER.select_and_detect(
                         enabled_services,
                         values.get("vpnProvider", [""])[0],
+                        connections,
                     ))
                 return self.send_json(200, RECONCILER.detect_apps())
+            if path == "/api/setup/credentials/bootstrap":
+                values = self._form()
+                return self.send_json(200, RECONCILER.bootstrap_credential(
+                    values.get("serviceId", [""])[0],
+                    values.get("username", [""])[0],
+                    values.get("password", [""])[0],
+                ))
             if path == "/api/setup/confirm":
                 values = self._form()
                 try:
@@ -121,6 +159,15 @@ class Handler(BaseHTTPRequestHandler):
                     enabled_services,
                     values.get("vpnProvider", [""])[0],
                 ))
+            if path == "/api/setup/cancel":
+                return self.send_json(200, RECONCILER.cancel_selection_change())
+            if path == "/api/setup/remove":
+                self._require_setup()
+                values = self._form()
+                return self.send_json(
+                    200,
+                    RECONCILER.remove_service(values.get("serviceId", [""])[0]),
+                )
             if path == "/api/vpn/login":
                 self._require_setup()
                 values = self._form()
@@ -136,6 +183,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(root_ids, dict):
                     raise ValueError("rootIds must be a JSON object")
                 storage = RECONCILER.save_storage(values.get("mode", ["local"])[0], root_ids)
+                return self.send_json(200, storage)
+            if path == "/api/storage/library":
+                self._require_setup()
+                values = self._form()
+                storage = RECONCILER.save_library_storage(
+                    values.get("libraryKey", [""])[0],
+                    values.get("source", [""])[0],
+                    values.get("rootId", [""])[0],
+                    values.get("path", [""])[0],
+                )
                 return self.send_json(200, storage)
             return self.send_json(404, {"error": "Not found"})
         except (ValueError, RuntimeError) as error:
@@ -159,6 +216,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    if RECONCILER.settings.docker_broker_url:
+        telemetry = DockerTelemetryLoop(RECONCILER)
+        threading.Thread(
+            target=telemetry.run, name="docker-telemetry", daemon=True,
+        ).start()
     loop = ReconcileLoop(RECONCILER)
     threading.Thread(target=loop.run, name="reconcile-loop", daemon=True).start()
     port = int(os.environ.get("PORT", "8080"))

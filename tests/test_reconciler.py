@@ -3,6 +3,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -14,7 +15,10 @@ sys.path.insert(0, str(SOURCE))
 
 from dashboard import PAGE, render_page
 from api_keys import ApiKeyResolver
-from catalog import CORE_MODULES, STACK_PROFILES, dependencies_for, normalize_modules, validate_modules
+from catalog import (
+    CORE_MODULES, SERVICE_MODULES, dependencies_for, normalize_modules,
+    validate_modules,
+)
 from http_client import RequestError, Response
 from reconciler import (
     DEPENDENCIES, MODULE_CATALOG_MARKER_TAG, MODULE_MARKER_PREFIX,
@@ -28,6 +32,8 @@ from storage import LIBRARY_DEFINITIONS, LOCAL_ROOTS, NETWORK_ROOTS, StorageSett
 def environment(_state_dir=None):
     values = {
         "DEVICE_DOMAIN_NAME": "umbrel.local",
+        "UMBREL_ARR_ENABLED_SERVICES": ",".join(REQUIRED_APPS),
+        "UMBREL_ARR_VPN_PROVIDER": "privado",
         "UMBREL_ARR_PRIVADO_VPN_URL": "http://vpn:8080",
         "UMBREL_ARR_FLARESOLVERR_URL": "http://flare:8191",
         "UMBREL_ARR_PROWLARR_URL": "http://prowlarr:9696",
@@ -58,6 +64,7 @@ class FakeClient:
         self.vpn = {"credentialsConfigured": False, "state": "down"}
         self.tags = []
         self.roots = {}
+        self.filesystems = {}
 
     def request(self, method, url, headers=None, body=None, timeout=20):
         self.calls.append(("request", method, url, headers, body))
@@ -77,12 +84,32 @@ class FakeClient:
         self.calls.append(("json", method, url, api_key, payload, headers))
         if url.endswith("/api/status"):
             return self.vpn
+        if method == "DELETE" and "/api/v1/tag/" in url:
+            tag_id = int(url.rsplit("/", 1)[-1])
+            self.tags = [item for item in self.tags if item.get("id") != tag_id]
+            return {}
         if url.endswith("/api/v1/tag"):
             if method == "POST":
                 item = {**payload, "id": len(self.tags) + 1}
                 self.tags.append(item)
                 return item
             return [dict(item) for item in self.tags]
+        if "/filesystem?" in url:
+            target = urlsplit(url)
+            host = url.split("/api/", 1)[0]
+            path = parse_qs(target.query).get("path", ["/"])[0]
+            value = self.filesystems.get(host, {}).get(path)
+            if isinstance(value, Exception):
+                raise value
+            if value is None:
+                value = {
+                    "parent": None if path == "/" else str(Path(path).parent),
+                    "directories": [],
+                }
+            return {
+                **value,
+                "directories": [dict(item) for item in value.get("directories", [])],
+            }
         if "/api/" in url and url.endswith("/rootfolder"):
             host = url.split("/api/", 1)[0]
             roots = self.roots.setdefault(host, [])
@@ -96,6 +123,28 @@ class FakeClient:
         if url.endswith("/qualityprofile"):
             return [{"id": 4, "name": "Any"}]
         return {}
+
+
+class DockerBrokerClient(FakeClient):
+    def __init__(self, snapshot=None, error=None):
+        super().__init__()
+        self.docker_snapshot = snapshot or {"updatedAt": 100, "services": {}}
+        self.docker_error = error
+
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        if url == "http://docker-inventory:8765/v1/snapshot":
+            self.calls.append(("json", method, url, api_key, payload, headers))
+            if self.docker_error:
+                raise self.docker_error
+            return json.loads(json.dumps(self.docker_snapshot))
+        return super().json(method, url, api_key, payload, headers)
+
+
+class FailingTagDeleteClient(FakeClient):
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        if method == "DELETE" and "/api/v1/tag/" in url:
+            raise RequestError("Prowlarr marker update failed", 503)
+        return super().json(method, url, api_key, payload, headers)
 
 
 class QbitAuthClient(FakeClient):
@@ -293,6 +342,242 @@ class MediaServerClient(FakeClient):
         return super().json(method, url, api_key, payload, headers)
 
 
+class JellyfinBootstrapClient(FakeClient):
+    def __init__(
+        self, keys=None, administrator=True, reject_login=False,
+        fail_key_list=False, fail_logout=False,
+    ):
+        super().__init__()
+        self.keys = [dict(item) for item in (keys or [])]
+        self.administrator = administrator
+        self.reject_login = reject_login
+        self.fail_key_list = fail_key_list
+        self.fail_logout = fail_logout
+        self.admin_token = "private-admin-session"
+        self.created = 0
+        self.logged_out = 0
+
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        self.calls.append(("json", method, url, api_key, payload, headers))
+        path = urlsplit(url).path
+        if path == "/Users/AuthenticateByName":
+            if self.reject_login:
+                raise RequestError(
+                    "password=private-password token=private-admin-session", 401,
+                )
+            return {"AccessToken": self.admin_token}
+        if path == "/Users/Me":
+            return {"Policy": {"IsAdministrator": self.administrator}}
+        if path == "/Auth/Keys":
+            if method == "POST":
+                self.created += 1
+                self.keys.append({
+                    "Name": "umbrelarr",
+                    "AccessToken": f"dedicated-key-{self.created}",
+                })
+                return None
+            if self.fail_key_list:
+                raise RequestError("token=private-admin-session upstream failed", 503)
+            return {"Items": [dict(item) for item in self.keys]}
+        if path == "/System/Info":
+            token = (headers or {}).get("X-Emby-Token", "")
+            valid = {item.get("AccessToken") for item in self.keys}
+            if token not in valid:
+                raise RequestError("token=rejected-private-key", 401)
+            return {"Version": "10.11"}
+        if path == "/Sessions/Logout":
+            self.logged_out += 1
+            if self.fail_logout:
+                raise RequestError("logout failed", 503)
+            return None
+        return super().json(method, url, api_key, payload, headers)
+
+
+class AllServicesClient(StackClient):
+    """Stateful native-API simulator for the complete supported service fleet."""
+
+    def __init__(self):
+        super().__init__()
+        self.arr_roots = {}
+        self.arr_clients = {}
+        self.preferences = {"web_ui_domain_list": "existing.example"}
+        self.profilarr_databases = [{
+            "id": 1,
+            "name": "Dictionarry",
+            "repository_url": "https://github.com/Dictionarry-Hub/database",
+        }]
+        self.profilarr_instances = []
+        self.overseerr_servers = {"sonarr": [], "radarr": []}
+        self.jellyfin_folders = []
+        self.plex_sections = []
+
+    def request(self, method, url, headers=None, body=None, timeout=20):
+        self.calls.append(("request", method, url, headers, body))
+        if "/api?" in url and "mode=version" in url:
+            return Response(200, {}, b'{"version":"4.5.0"}')
+        return Response(200, {}, b"ok")
+
+    def form(self, method, url, values, headers=None):
+        self.calls.append(("form", method, url, headers, values))
+        if url.endswith("/api/v2/auth/login"):
+            return Response(
+                200,
+                {"Set-Cookie": "SID=all-services-session; HttpOnly; path=/"},
+                b"Ok.",
+            )
+        if url.endswith("/api/v2/app/setPreferences"):
+            self.preferences.update(json.loads(values["json"]))
+            return Response(200, {}, b"")
+        if url.endswith("/api") and values.get("mode") == "get_config":
+            return Response(
+                200, {},
+                b'{"config":{"misc":{"host_whitelist":"sab,localhost"}}}',
+            )
+        if url.endswith("/arr/new"):
+            if not any(item["name"] == values["name"] for item in self.profilarr_instances):
+                self.profilarr_instances.append({
+                    "id": len(self.profilarr_instances) + 1,
+                    "name": values["name"],
+                })
+            return Response(200, {}, b"{}")
+        return Response(200, {}, b"{}")
+
+    def json(self, method, url, api_key=None, payload=None, headers=None):
+        target = urlsplit(url)
+        path = target.path
+        self.calls.append(("json", method, url, api_key, payload, headers))
+        if path == "/api/status":
+            return {
+                "credentialsConfigured": True,
+                "state": "healthy",
+                "publicIp": "203.0.113.10",
+            }
+        if path == "/v1" and method == "POST":
+            return {"status": "ok", "sessions": []}
+        if path == "/api/v2/app/preferences":
+            return dict(self.preferences)
+        if target.hostname in {"sonarr", "sonarr4k", "radarr", "radarr4k", "lidarr"}:
+            route = path.split("/api/", 1)[-1]
+            roots = self.arr_roots.setdefault(target.hostname, [])
+            clients = self.arr_clients.setdefault(target.hostname, [])
+            if route.endswith("system/status"):
+                return {"version": "test"}
+            if route.endswith("metadataprofile"):
+                return [{"id": 3, "name": "Standard"}]
+            if route.endswith("qualityprofile"):
+                return [{"id": 4, "name": "Any"}]
+            if route.endswith("rootfolder"):
+                if method == "POST":
+                    created = {**(payload or {}), "id": len(roots) + 1}
+                    roots.append(created)
+                    return dict(created)
+                return [dict(item) for item in roots]
+            if route.endswith("downloadclient/schema"):
+                return [
+                    schema("QBittorrent", {
+                        "host": "", "port": 0, "useSsl": False,
+                        "urlBase": "", "category": "", "username": "",
+                        "password": "",
+                    }),
+                    schema("Sabnzbd", {
+                        "host": "", "port": 0, "useSsl": False,
+                        "urlBase": "", "category": "", "apiKey": "",
+                    }),
+                ]
+            if route.endswith("downloadclient"):
+                if method == "POST":
+                    created = {**(payload or {}), "id": len(clients) + 1}
+                    clients.append(created)
+                    return dict(created)
+                return [dict(item) for item in clients]
+            if "/downloadclient/" in route and method == "PUT":
+                return self._replace(clients, payload)
+        if target.hostname == "profilarr":
+            if path == "/api/v1/status":
+                return {"ok": True}
+            if path == "/api/v1/databases":
+                return [dict(item) for item in self.profilarr_databases]
+            if path == "/api/v1/arr":
+                return [dict(item) for item in self.profilarr_instances]
+        if target.hostname == "overseerr":
+            if path == "/api/v1/settings/public":
+                return {"initialized": True}
+            if path == "/api/v1/settings/main":
+                return {"applicationTitle": "Overseerr"}
+            for kind in ("sonarr", "radarr"):
+                route = f"/api/v1/settings/{kind}"
+                if path == f"{route}/test":
+                    is_4k = str((payload or {}).get("hostname", "")).endswith("4k")
+                    if kind == "sonarr":
+                        root = "/downloads/shows-4k" if is_4k else "/downloads/shows"
+                    else:
+                        root = "/downloads/movies-4k" if is_4k else "/downloads/movies"
+                    return {
+                        "rootFolders": [{"id": 1, "path": root}],
+                        "profiles": [
+                            {"id": 1, "name": "1080p Quality HDR"},
+                            {"id": 2, "name": "2160p Quality"},
+                        ],
+                        "languageProfiles": [{"id": 1, "name": "English"}],
+                    }
+                if path == route:
+                    if method == "POST":
+                        created = {
+                            **(payload or {}),
+                            "id": len(self.overseerr_servers[kind]) + 1,
+                        }
+                        self.overseerr_servers[kind].append(created)
+                        return dict(created)
+                    return [dict(item) for item in self.overseerr_servers[kind]]
+                if path.startswith(f"{route}/") and method == "PUT":
+                    server_id = int(path.rsplit("/", 1)[-1])
+                    replacement = {**(payload or {}), "id": server_id}
+                    index = next(
+                        index for index, item in enumerate(self.overseerr_servers[kind])
+                        if item["id"] == server_id
+                    )
+                    self.overseerr_servers[kind][index] = replacement
+                    return dict(replacement)
+        if target.hostname == "jellyfin":
+            if path == "/System/Info":
+                return {"Version": "10.11"}
+            if path == "/Library/VirtualFolders":
+                if method == "POST":
+                    values = parse_qs(target.query)
+                    self.jellyfin_folders.append({
+                        "Name": values["name"][0],
+                        "Locations": [],
+                    })
+                    return None
+                return [dict(item) for item in self.jellyfin_folders]
+            if path == "/Library/VirtualFolders/Paths" and method == "POST":
+                folder = next(
+                    item for item in self.jellyfin_folders
+                    if item["Name"] == payload["Name"]
+                )
+                if payload["Path"] not in folder["Locations"]:
+                    folder["Locations"].append(payload["Path"])
+                return None
+        if target.hostname == "plex" and path == "/library/sections":
+            if method == "POST":
+                values = parse_qs(target.query)
+                self.plex_sections.append({
+                    "key": str(len(self.plex_sections) + 1),
+                    "title": values["name"][0],
+                    "Location": [{"path": values["locations"][0]}],
+                })
+                return None
+            return {
+                "MediaContainer": {
+                    "Directory": [dict(item) for item in self.plex_sections],
+                },
+            }
+        # The parent implementation records calls too; remove this one so
+        # assertions continue to represent one outbound API call per request.
+        self.calls.pop()
+        return super().json(method, url, api_key, payload, headers)
+
+
 class ReconcilerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -302,6 +587,34 @@ class ReconcilerTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def confirmed_reconciler(self, modules, provider="direct", client=None):
+        client = client or FakeClient()
+        labels = [
+            SETUP_MARKER_TAG,
+            SETUP_READY_MARKER_TAG,
+            MODULE_CATALOG_MARKER_TAG,
+            f"{VPN_PROVIDER_MARKER_PREFIX}{provider}",
+            *(f"{MODULE_MARKER_PREFIX}{slug}" for slug in modules),
+        ]
+        client.tags.extend(
+            {"id": index + 1, "label": label}
+            for index, label in enumerate(labels)
+        )
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(reconciler.ensure_setup_ready())
+        reconciler.reconcile_async = lambda: True
+        return reconciler, client
+
+    def jellyfin_bootstrap_reconciler(self, client, jellyfin_environment_key=""):
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_JELLYFIN_API_KEY"] = jellyfin_environment_key
+        reconciler = Reconciler(Settings(values), client)
+        snapshot = reconciler.select_and_detect(
+            ["prowlarr", "sonarr", "jellyfin"], "direct",
+        )
+        jellyfin = next(item for item in snapshot["apps"] if item["id"] == "jellyfin")
+        return reconciler, snapshot, jellyfin
+
     def test_settings_define_hd_and_4k_instances(self):
         instances = {item.slug: (item.root, item.category, item.is_4k) for item in self.reconciler.arrs}
         self.assertEqual(instances["sonarr"], ("/downloads/shows", "tv", False))
@@ -309,6 +622,844 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(instances["radarr"], ("/downloads/movies", "movies", False))
         self.assertEqual(instances["radarr-4k"], ("/downloads/movies-4k", "movies-4k", True))
         self.assertEqual(instances["lidarr"], ("/downloads/music", "music", False))
+
+    def test_fresh_install_starts_with_only_required_services_and_direct_networking(self):
+        settings = Settings({})
+        reconciler = Reconciler(settings, FakeClient())
+
+        self.assertFalse(settings.modules_configured)
+        self.assertEqual(settings.enabled_modules, CORE_MODULES)
+        self.assertEqual(settings.vpn_provider_id, "direct")
+        services = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }
+        self.assertEqual(set(services), CORE_MODULES)
+        self.assertEqual(services["umbrelarr"]["status"], "action_required")
+        self.assertEqual(services["prowlarr"]["status"], "waiting")
+        self.assertEqual(services["prowlarr"]["checked_at"], 0)
+        self.assertEqual(services["prowlarr"]["checks"], [])
+
+    def test_complete_catalog_sets_up_and_reconciles_idempotently(self):
+        selected = {module.id for module in SERVICE_MODULES}
+        values = environment(self.temp.name)
+        values["UMBREL_ARR_ENABLED_SERVICES"] = ",".join(sorted(selected))
+        client = AllServicesClient()
+        reconciler = Reconciler(Settings(values), client)
+
+        detected = reconciler.select_and_detect(selected, "privado")
+
+        self.assertEqual(set(detected["enabledServices"]), selected)
+        self.assertEqual(detected["requiredCount"], len(selected) - 1)
+        self.assertEqual(detected["detectedCount"], len(selected) - 1)
+        self.assertTrue(detected["canConfirm"])
+        self.assertTrue(all(item["reachable"] for item in detected["apps"]))
+        self.assertTrue(all(item["credentials"] for item in detected["apps"]))
+
+        reconciler.reconcile_async = lambda: True
+        connected = reconciler.confirm_setup(
+            "local",
+            enabled_services=selected,
+            vpn_provider="privado",
+        )
+        self.assertTrue(connected["confirmed"])
+        self.assertEqual(connected["phase"], "confirmed")
+
+        reconciler.reconcile()
+        first = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }
+        self.assertEqual(set(first), selected)
+        self.assertEqual(
+            {slug: item["status"] for slug, item in first.items()},
+            {slug: "healthy" for slug in selected},
+        )
+
+        managed_counts = {
+            "roots": sum(len(items) for items in client.arr_roots.values()),
+            "downloadClients": sum(len(items) for items in client.arr_clients.values()),
+            "prowlarrApplications": len(client.applications),
+            "prowlarrProxies": len(client.proxies),
+            "profilarrInstances": len(client.profilarr_instances),
+            "overseerrServers": sum(len(items) for items in client.overseerr_servers.values()),
+            "jellyfinLibraries": len(client.jellyfin_folders),
+            "plexLibraries": len(client.plex_sections),
+        }
+        self.assertEqual(managed_counts, {
+            "roots": 5,
+            "downloadClients": 10,
+            "prowlarrApplications": 5,
+            "prowlarrProxies": 1,
+            "profilarrInstances": 4,
+            "overseerrServers": 4,
+            "jellyfinLibraries": 5,
+            "plexLibraries": 5,
+        })
+
+        reconciler.reconcile()
+        second = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }
+        self.assertEqual(
+            {slug: item["status"] for slug, item in second.items()},
+            {slug: "healthy" for slug in selected},
+        )
+        self.assertEqual(
+            {
+                "roots": sum(len(items) for items in client.arr_roots.values()),
+                "downloadClients": sum(len(items) for items in client.arr_clients.values()),
+                "prowlarrApplications": len(client.applications),
+                "prowlarrProxies": len(client.proxies),
+                "profilarrInstances": len(client.profilarr_instances),
+                "overseerrServers": sum(len(items) for items in client.overseerr_servers.values()),
+                "jellyfinLibraries": len(client.jellyfin_folders),
+                "plexLibraries": len(client.plex_sections),
+            },
+            managed_counts,
+        )
+
+    def test_dashboard_does_not_present_catalog_defaults_as_local_services(self):
+        reconciler = Reconciler(Settings({}), FakeClient())
+
+        snapshot = reconciler.dashboard_snapshot()
+
+        self.assertEqual([item["id"] for item in snapshot["services"]], ["umbrelarr"])
+        self.assertEqual(snapshot["inventory"]["mode"], "direct")
+        self.assertFalse(snapshot["inventory"]["configured"])
+        self.assertEqual(snapshot["inventory"]["discoveredCount"], 0)
+
+    def test_dashboard_shows_an_explicit_direct_service_without_docker_inventory(self):
+        settings = Settings({
+            "UMBREL_ARR_PROWLARR_URL": "http://prowlarr:9696",
+            "UMBREL_ARR_PROWLARR_API_KEY": "prowlarr-key",
+        })
+        reconciler = Reconciler(settings, FakeClient())
+
+        snapshot = reconciler.dashboard_snapshot()
+
+        services = {item["id"]: item for item in snapshot["services"]}
+        self.assertEqual(set(services), {"umbrelarr", "prowlarr"})
+        self.assertEqual(services["prowlarr"]["discoverySource"], "direct")
+        self.assertTrue(services["prowlarr"]["managed"])
+
+    def test_setup_snapshot_exposes_direct_connection_state_without_secrets(self):
+        reconciler = Reconciler(Settings({}), FakeClient())
+
+        snapshot = reconciler.setup_snapshot()
+        prowlarr = next(item for item in snapshot["modules"] if item["id"] == "prowlarr")
+        flaresolverr = next(
+            item for item in snapshot["modules"] if item["id"] == "flaresolverr"
+        )
+
+        self.assertNotIn("installedAppUrl", snapshot)
+        self.assertEqual(prowlarr["connectionUrl"], "http://umbrel.local:30982")
+        self.assertFalse(prowlarr["connectionConfigured"])
+        self.assertFalse(prowlarr["credentialConfigured"])
+        self.assertEqual(prowlarr["credentialSource"], "missing")
+        self.assertEqual(
+            prowlarr["apiKeyEnvironmentVariable"],
+            "UMBREL_ARR_PROWLARR_API_KEY",
+        )
+        self.assertFalse(prowlarr["environmentCredentialConfigured"])
+        self.assertNotIn("apiKey", prowlarr)
+        self.assertFalse(flaresolverr["requires_api_key"])
+        self.assertNotIn("apiKeyEnvironmentVariable", flaresolverr)
+        self.assertNotIn("credentialSource", flaresolverr)
+        self.assertNotIn("credentialConfigured", flaresolverr)
+        self.assertNotIn("environmentCredentialConfigured", flaresolverr)
+
+    def test_setup_snapshot_reports_configured_direct_connection_without_key_value(self):
+        reconciler = Reconciler(
+            Settings({
+                "UMBREL_ARR_PROWLARR_URL": "http://prowlarr:9696",
+                "UMBREL_ARR_PROWLARR_API_KEY": "private-key",
+            }),
+            FakeClient(),
+        )
+
+        snapshot = reconciler.setup_snapshot()
+        prowlarr = next(item for item in snapshot["modules"] if item["id"] == "prowlarr")
+
+        self.assertEqual(prowlarr["connectionUrl"], "http://prowlarr:9696")
+        self.assertTrue(prowlarr["connectionConfigured"])
+        self.assertTrue(prowlarr["credentialConfigured"])
+        self.assertEqual(prowlarr["credentialSource"], "environment")
+        self.assertTrue(prowlarr["environmentCredentialConfigured"])
+        self.assertNotIn("private-key", str(snapshot))
+
+    def test_platform_login_redirect_requires_a_direct_connection(self):
+        class UmbrelProxyClient(FakeClient):
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append(("request", method, url, headers, body))
+                return Response(
+                    200,
+                    {},
+                    b"Umbrel login",
+                    "http://umbrel.local:2000/?origin=host&app=umbrel-arr-prowlarr",
+                )
+
+        settings = Settings({})
+        reconciler = Reconciler(settings, UmbrelProxyClient())
+
+        self.assertEqual(settings.url("prowlarr"), "http://umbrel.local:30982")
+        self.assertFalse(settings.url_is_configured("prowlarr"))
+        snapshot = reconciler.detect_apps()
+        prowlarr = snapshot["apps"][0]
+        self.assertTrue(prowlarr["reachable"])
+        self.assertTrue(prowlarr["detected"])
+        self.assertFalse(prowlarr["credentials"])
+        self.assertEqual(prowlarr["action"], "direct_connection_required")
+        self.assertIn("platform login", prowlarr["detail"])
+        self.assertFalse(snapshot["canConfirm"])
+
+    def test_local_discovery_uses_a_direct_api_endpoint_when_available(self):
+        settings = Settings({"UMBREL_ARR_PROWLARR_API_KEY": "prowlarr-key"})
+        reconciler = Reconciler(settings, FakeClient())
+
+        snapshot = reconciler.detect_apps()
+        prowlarr = snapshot["apps"][0]
+        self.assertEqual(settings.url("prowlarr"), "http://umbrel.local:30982")
+        self.assertTrue(prowlarr["reachable"])
+        self.assertTrue(prowlarr["credentials"])
+        self.assertEqual(prowlarr["action"], "none")
+        self.assertTrue(snapshot["canConfirm"])
+
+    def test_private_service_url_overrides_external_discovery_address(self):
+        settings = Settings({
+            "UMBREL_ARR_PROWLARR_URL": "http://umbrel-arr-prowlarr_server_1:9696/",
+        })
+
+        self.assertTrue(settings.url_is_configured("prowlarr"))
+        self.assertEqual(
+            settings.url("prowlarr"),
+            "http://umbrel-arr-prowlarr_server_1:9696",
+        )
+
+    def test_base_url_changes_default_service_links_without_overriding_service_urls(self):
+        local = Settings({"UMBREL_ARR_BASE_URL": "http://localhost/"})
+        self.assertEqual(local.base_url, "http://localhost")
+        self.assertEqual(local.device_domain, "localhost")
+        self.assertEqual(local.url("prowlarr"), "http://localhost:30982")
+        self.assertEqual(local.external_url("sabnzbd"), "http://localhost:30984")
+
+        umbrel = Settings({"UMBREL_ARR_BASE_URL": "https://umbrel.local"})
+        self.assertEqual(umbrel.url("prowlarr"), "https://umbrel.local:30982")
+
+        overridden = Settings({
+            "UMBREL_ARR_BASE_URL": "http://localhost",
+            "UMBREL_ARR_PROWLARR_URL": "http://prowlarr:9696/",
+        })
+        self.assertEqual(overridden.url("prowlarr"), "http://prowlarr:9696")
+        self.assertEqual(
+            overridden.external_url("prowlarr"),
+            "http://localhost:30982",
+        )
+
+    def test_base_url_rejects_ambiguous_or_unsafe_values(self):
+        invalid = (
+            "localhost",
+            "file:///tmp/services",
+            "http://user:secret@localhost",
+            "http://localhost:8080",
+            "http://localhost/services",
+            "http://localhost?service=prowlarr",
+        )
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "UMBREL_ARR_BASE_URL"):
+                    Settings({"UMBREL_ARR_BASE_URL": value})
+
+    def test_direct_connection_draft_is_used_without_exposing_the_api_key(self):
+        settings = Settings({})
+        client = FakeClient()
+        reconciler = Reconciler(settings, client)
+
+        snapshot = reconciler.select_and_detect(
+            ["prowlarr"],
+            "direct",
+            {"prowlarr": {
+                "url": "http://prowlarr:9696/",
+                "apiKey": "direct-key",
+                "credentialSource": "ui",
+            }},
+        )
+
+        self.assertEqual(settings.url("prowlarr"), "http://prowlarr:9696")
+        self.assertEqual(settings.key("prowlarr"), "direct-key")
+        self.assertTrue(snapshot["canConfirm"])
+        prowlarr = next(item for item in snapshot["modules"] if item["id"] == "prowlarr")
+        self.assertEqual(prowlarr["credentialSource"], "ui")
+        self.assertFalse(prowlarr["environmentCredentialConfigured"])
+        self.assertNotIn("direct-key", str(snapshot))
+        self.assertTrue(any(
+            call[0] == "json"
+            and call[2] == "http://prowlarr:9696/api/v1/system/status"
+            and call[3] == "direct-key"
+            for call in client.calls
+        ))
+
+    def test_environment_source_replaces_a_ui_key_without_exposing_either_value(self):
+        settings = Settings({"UMBREL_ARR_PROWLARR_API_KEY": "environment-key"})
+        settings.apply_connections(
+            {"prowlarr": {
+                "url": "http://prowlarr:9696",
+                "apiKey": "ui-key",
+                "credentialSource": "ui",
+            }},
+            {"umbrelarr", "prowlarr"},
+        )
+        self.assertEqual(settings.key("prowlarr"), "ui-key")
+
+        settings.apply_connections(
+            {"prowlarr": {
+                "url": "http://prowlarr:9696",
+                "credentialSource": "environment",
+            }},
+            {"umbrelarr", "prowlarr"},
+        )
+
+        self.assertEqual(settings.key("prowlarr"), "environment-key")
+        metadata = settings.credential_metadata("prowlarr")
+        self.assertEqual(metadata["credentialSource"], "environment")
+        self.assertNotIn("environment-key", str(metadata))
+        self.assertNotIn("ui-key", str(metadata))
+
+    def test_canceling_setup_forgets_direct_connection_draft(self):
+        settings = Settings({})
+        reconciler = Reconciler(settings, FakeClient())
+        reconciler.select_and_detect(
+            ["prowlarr"],
+            "direct",
+            {"prowlarr": {"url": "http://prowlarr:9696", "apiKey": "direct-key"}},
+        )
+
+        reconciler.cancel_selection_change()
+
+        self.assertEqual(settings.url("prowlarr"), "http://umbrel.local:30982")
+        self.assertEqual(settings.key("prowlarr"), "")
+
+    def test_direct_connection_validation_is_atomic(self):
+        settings = Settings({})
+
+        with self.assertRaisesRegex(ValueError, "without credentials"):
+            settings.apply_connections(
+                {"prowlarr": {"url": "http://user:secret@prowlarr:9696", "apiKey": "key"}},
+                {"umbrelarr", "prowlarr"},
+            )
+
+        self.assertEqual(
+            settings.connection_overrides(),
+            {"urls": {}, "keys": {}, "keySources": {}},
+        )
+
+        with self.assertRaisesRegex(ValueError, "selected service"):
+            settings.apply_connections(
+                {"sonarr": {"url": "http://sonarr:8989", "apiKey": "key"}},
+                {"umbrelarr", "prowlarr"},
+            )
+
+        with self.assertRaisesRegex(ValueError, "Do not submit an API key"):
+            settings.apply_connections(
+                {"prowlarr": {
+                    "url": "http://prowlarr:9696",
+                    "apiKey": "key",
+                    "credentialSource": "environment",
+                }},
+                {"umbrelarr", "prowlarr"},
+            )
+
+    def test_docker_inventory_drives_installed_detection_and_resources(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+            "UMBREL_ARR_DOCKER_BROKER_TOKEN": "inventory-secret",
+        })
+        client = DockerBrokerClient({
+            "updatedAt": 1_700_000_000,
+            "services": {
+                "umbrelarr": {
+                    "id": "umbrelarr",
+                    "containerId": "manager123456",
+                    "name": "umbrel-arr-umbrelarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {
+                        "cpuPercent": 12.5,
+                        "onlineCpus": 4,
+                        "cpuCapacityPercent": 400,
+                        "memory": {
+                            "usedBytes": 128,
+                            "totalBytes": 1024,
+                            "percent": 12.5,
+                        },
+                        "blockIO": {"readBytes": 10, "writeBytes": 20},
+                        "network": {"rxBytes": 30, "txBytes": 40},
+                    },
+                },
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "prowlarr1234",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {
+                        "cpuPercent": 7.25,
+                        "onlineCpus": 8,
+                        "cpuCapacityPercent": 800,
+                        "memory": {
+                            "usedBytes": 256,
+                            "totalBytes": 2048,
+                            "percent": 12.5,
+                        },
+                        "blockIO": {"readBytes": 50, "writeBytes": 60},
+                        "network": {"rxBytes": 70, "txBytes": 80},
+                    },
+                },
+            },
+        })
+        reconciler = Reconciler(Settings(values), client)
+
+        snapshot = reconciler.detect_apps()
+
+        prowlarr = snapshot["apps"][0]
+        self.assertTrue(prowlarr["detected"])
+        self.assertTrue(prowlarr["reachable"])
+        self.assertEqual(prowlarr["container"]["state"], "running")
+        self.assertEqual(prowlarr["action"], "none")
+        module = next(item for item in snapshot["modules"] if item["id"] == "prowlarr")
+        self.assertTrue(module["installed"])
+        self.assertEqual(module["container"]["health"], "healthy")
+        services = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }
+        self.assertEqual(services["prowlarr"]["resources"]["cpu"]["percent"], 7.25)
+        self.assertEqual(services["prowlarr"]["resources"]["cpu"]["onlineCpus"], 8)
+        self.assertEqual(services["prowlarr"]["resources"]["cpu"]["capacityPercent"], 800)
+        self.assertEqual(services["prowlarr"]["resources"]["blockIo"]["writeBytes"], 60)
+        broker_call = next(
+            call for call in client.calls
+            if call[0] == "json" and call[2].endswith("/v1/snapshot")
+        )
+        self.assertEqual(broker_call[1], "GET")
+        self.assertEqual(
+            broker_call[5]["Authorization"], "Bearer inventory-secret",
+        )
+
+    def test_dashboard_includes_discovered_unmanaged_local_services(self):
+        values = {
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        }
+        client = DockerBrokerClient({
+            "updatedAt": 100,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "prowlarr12345",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {"cpuPercent": 12.5, "onlineCpus": 4},
+                },
+                "sonarr": {
+                    "id": "sonarr",
+                    "containerId": "sonarr1234567",
+                    "name": "umbrel-arr-sonarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {
+                        "cpuPercent": 25.0,
+                        "onlineCpus": 4,
+                        "memory": {"usedBytes": 100, "totalBytes": 1000, "percent": 10.0},
+                    },
+                },
+            },
+        })
+        reconciler = Reconciler(Settings(values), client)
+        self.assertTrue(reconciler.refresh_container_state())
+
+        snapshot = reconciler.dashboard_snapshot()
+
+        services = {item["id"]: item for item in snapshot["services"]}
+        self.assertEqual(set(services), {"umbrelarr", "prowlarr", "sonarr"})
+        self.assertTrue(services["prowlarr"]["managed"])
+        self.assertFalse(services["sonarr"]["managed"])
+        self.assertEqual(services["sonarr"]["detail"], "Installed locally and available to manage")
+        self.assertEqual(services["sonarr"]["resources"]["cpu"]["percent"], 25.0)
+        self.assertEqual(snapshot["inventory"]["discoveredCount"], 2)
+        self.assertTrue(snapshot["inventory"]["available"])
+
+    def test_docker_inventory_distinguishes_stopped_from_missing_apps(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+        stopped_client = DockerBrokerClient({
+            "updatedAt": 100,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "stopped12345",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "exited",
+                    "health": "none",
+                    "resources": None,
+                },
+            },
+        })
+        stopped = Reconciler(Settings(values), stopped_client).detect_apps()
+        app = stopped["apps"][0]
+        self.assertTrue(app["detected"])
+        self.assertFalse(app["reachable"])
+        self.assertEqual(app["action"], "start_service")
+        self.assertEqual(stopped["detectedCount"], 1)
+        self.assertFalse(stopped["canConfirm"])
+        self.assertFalse(any(call[0] == "request" for call in stopped_client.calls))
+
+        missing_client = DockerBrokerClient({"updatedAt": 101, "services": {}})
+        missing = Reconciler(Settings(values), missing_client).detect_apps()
+        app = missing["apps"][0]
+        self.assertFalse(app["detected"])
+        self.assertEqual(app["container"]["state"], "not_installed")
+        self.assertEqual(app["action"], "install_or_start")
+        self.assertEqual(missing["detectedCount"], 0)
+        self.assertFalse(any(call[0] == "request" for call in missing_client.calls))
+
+    def test_docker_inventory_retains_last_resource_sample_when_container_stops(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+        client = DockerBrokerClient({
+            "updatedAt": 1_700_000_000,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "running12345",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {
+                        "cpuPercent": 18.5,
+                        "memory": {
+                            "usedBytes": 512,
+                            "totalBytes": 2048,
+                            "percent": 25,
+                        },
+                        "blockIO": {"readBytes": 10, "writeBytes": 20},
+                        "network": {"rxBytes": 30, "txBytes": 40},
+                    },
+                },
+            },
+        })
+        reconciler = Reconciler(Settings(values), client)
+
+        self.assertTrue(reconciler.refresh_container_state())
+        first = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }["prowlarr"]
+        self.assertEqual(first["resources"]["sampleState"], "current")
+        self.assertEqual(first["resources"]["updatedAt"], 1_700_000_000)
+
+        client.docker_snapshot = {
+            "updatedAt": 1_700_000_015,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "running12345",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": None,
+                },
+            },
+        }
+
+        self.assertTrue(reconciler.refresh_container_state())
+        unavailable = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }["prowlarr"]
+        self.assertEqual(unavailable["container"]["state"], "running")
+        self.assertEqual(unavailable["container"]["updatedAt"], 1_700_000_015)
+        self.assertEqual(unavailable["resources"]["sampleState"], "last_sample")
+        self.assertEqual(unavailable["resources"]["updatedAt"], 1_700_000_000)
+
+        client.docker_snapshot = {
+            "updatedAt": 1_700_000_030,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "running12345",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "exited",
+                    "health": "none",
+                    "resources": None,
+                },
+            },
+        }
+
+        self.assertTrue(reconciler.refresh_container_state())
+        service = {
+            item["id"]: item for item in reconciler.runtime.snapshot()["services"]
+        }["prowlarr"]
+        self.assertEqual(service["container"]["state"], "exited")
+        self.assertEqual(service["container"]["updatedAt"], 1_700_000_030)
+        self.assertEqual(service["resources"]["sampleState"], "last_sample")
+        self.assertEqual(service["resources"]["updatedAt"], 1_700_000_000)
+        self.assertEqual(service["resources"]["cpu"]["percent"], 18.5)
+        self.assertEqual(service["resources"]["network"]["txBytes"], 40)
+
+    def test_docker_inventory_keeps_missing_metrics_partial_not_zero(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+        client = DockerBrokerClient({
+            "updatedAt": 1_700_000_000,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {
+                        "cpuPercent": None,
+                        "onlineCpus": 4,
+                        "cpuCapacityPercent": 400,
+                        "memory": {
+                            "usedBytes": 256,
+                            "totalBytes": 2048,
+                            "percent": 12.5,
+                        },
+                        "blockIO": None,
+                        "network": None,
+                    },
+                },
+            },
+        })
+        reconciler = Reconciler(Settings(values), client)
+
+        self.assertTrue(reconciler.refresh_container_state())
+        resources = next(
+            item for item in reconciler.runtime.snapshot()["services"]
+            if item["id"] == "prowlarr"
+        )["resources"]
+        self.assertEqual(resources["sampleState"], "current")
+        self.assertNotIn("cpu", resources)
+        self.assertNotIn("blockIo", resources)
+        self.assertNotIn("network", resources)
+        self.assertEqual(resources["memory"]["percent"], 12.5)
+
+        client.docker_snapshot["updatedAt"] = 1_700_000_030
+        client.docker_snapshot["services"]["prowlarr"]["resources"] = {
+            "cpuPercent": None,
+            "memory": None,
+            "blockIO": None,
+            "network": None,
+        }
+        self.assertTrue(reconciler.refresh_container_state())
+        retained = next(
+            item for item in reconciler.runtime.snapshot()["services"]
+            if item["id"] == "prowlarr"
+        )["resources"]
+        self.assertEqual(retained["sampleState"], "last_sample")
+        self.assertEqual(retained["updatedAt"], 1_700_000_000)
+        self.assertNotIn("cpu", retained)
+
+    def test_docker_inventory_failure_does_not_guess_from_http_reachability(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+        client = DockerBrokerClient(error=RequestError("Docker broker offline"))
+        snapshot = Reconciler(Settings(values), client).detect_apps()
+
+        app = snapshot["apps"][0]
+        self.assertFalse(app["detected"])
+        self.assertEqual(app["action"], "docker_unavailable")
+        self.assertIn("Docker inventory is unavailable", app["detail"])
+        self.assertFalse(snapshot["docker"]["available"])
+        self.assertFalse(any(call[0] == "request" for call in client.calls))
+
+    def test_docker_inventory_refreshes_are_serialized(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+
+        class BlockingBrokerClient(DockerBrokerClient):
+            def __init__(self):
+                super().__init__({"updatedAt": 100, "services": {}})
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.counter_lock = threading.Lock()
+                self.active = 0
+                self.max_active = 0
+                self.broker_calls = 0
+
+            def json(self, *args, **kwargs):
+                if len(args) > 1 and str(args[1]).endswith("/v1/snapshot"):
+                    with self.counter_lock:
+                        self.broker_calls += 1
+                        call_number = self.broker_calls
+                        self.active += 1
+                        self.max_active = max(self.max_active, self.active)
+                    try:
+                        if call_number == 1:
+                            self.entered.set()
+                            self.release.wait(timeout=1)
+                        return super().json(*args, **kwargs)
+                    finally:
+                        with self.counter_lock:
+                            self.active -= 1
+                return super().json(*args, **kwargs)
+
+        client = BlockingBrokerClient()
+        reconciler = Reconciler(Settings(values), client)
+        results = []
+        first = threading.Thread(target=lambda: results.append(reconciler.refresh_container_state()))
+        second = threading.Thread(target=lambda: results.append(reconciler.refresh_container_state()))
+        first.start()
+        self.assertTrue(client.entered.wait(timeout=1))
+        second.start()
+        client.release.set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+
+        self.assertEqual(results, [True, True])
+        self.assertEqual(client.broker_calls, 2)
+        self.assertEqual(client.max_active, 1)
+
+    def test_failed_docker_refresh_makes_cached_inventory_non_authoritative(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+        client = DockerBrokerClient({
+            "updatedAt": 1_700_000_000,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "prowlarr1234",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": {
+                        "cpuPercent": 7.25,
+                        "memory": {
+                            "usedBytes": 256,
+                            "totalBytes": 2048,
+                            "percent": 12.5,
+                        },
+                    },
+                },
+            },
+        })
+        reconciler = Reconciler(Settings(values), client)
+        self.assertTrue(reconciler.detect_apps()["canConfirm"])
+
+        client.docker_error = RequestError("Docker broker offline")
+        self.assertFalse(reconciler.refresh_container_state())
+        snapshot = reconciler.setup_snapshot()
+
+        self.assertFalse(snapshot["docker"]["available"])
+        app = snapshot["apps"][0]
+        self.assertFalse(app["detected"])
+        self.assertEqual(app["action"], "docker_unavailable")
+        self.assertFalse(snapshot["canConfirm"])
+        module = next(
+            item for item in snapshot["modules"] if item["id"] == "prowlarr"
+        )
+        self.assertIsNone(module["installed"])
+        self.assertEqual(module["container"], {})
+        service = next(
+            item for item in reconciler.runtime.snapshot()["services"]
+            if item["id"] == "prowlarr"
+        )
+        self.assertEqual(service["container"]["state"], "unknown")
+        self.assertEqual(service["resources"]["sampleState"], "last_sample")
+        self.assertEqual(service["resources"]["updatedAt"], 1_700_000_000)
+
+    def test_confirmation_revalidates_docker_state_after_review(self):
+        values = environment(self.temp.name)
+        values.update({
+            "UMBREL_ARR_ENABLED_SERVICES": "prowlarr",
+            "UMBREL_ARR_VPN_PROVIDER": "direct",
+            "UMBREL_ARR_DOCKER_BROKER_URL": "http://docker-inventory:8765",
+        })
+        running = {
+            "updatedAt": 1_700_000_000,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "prowlarr1234",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "running",
+                    "health": "healthy",
+                    "resources": None,
+                },
+            },
+        }
+        stopped = {
+            "updatedAt": 1_700_000_001,
+            "services": {
+                "prowlarr": {
+                    "id": "prowlarr",
+                    "containerId": "prowlarr1234",
+                    "name": "umbrel-arr-prowlarr_server_1",
+                    "state": "exited",
+                    "health": "none",
+                    "resources": None,
+                },
+            },
+        }
+        scenarios = (
+            ("stopped", stopped, None, "Install or start"),
+            (
+                "missing",
+                {"updatedAt": 1_700_000_002, "services": {}},
+                None,
+                "Install or start",
+            ),
+            (
+                "broker failure",
+                running,
+                RequestError("Docker broker offline"),
+                "Docker inventory is unavailable",
+            ),
+        )
+
+        for name, current, error, message in scenarios:
+            with self.subTest(name=name):
+                client = DockerBrokerClient(running)
+                reconciler = Reconciler(Settings(values), client)
+                self.assertTrue(reconciler.detect_apps()["canConfirm"])
+                client.docker_snapshot = current
+                client.docker_error = error
+
+                with self.assertRaisesRegex(ValueError, message):
+                    reconciler.confirm_setup("local")
+
+                self.assertEqual(client.tags, [])
+                self.assertFalse(any(
+                    call[0] == "json"
+                    and call[1] == "POST"
+                    and call[2].endswith("/api/v1/tag")
+                    for call in client.calls
+                ))
 
     def test_module_catalog_derives_dependencies_from_selection(self):
         selected = {"umbrelarr", "prowlarr", "qbittorrent", "sonarr"}
@@ -325,34 +1476,22 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(media_dependencies["jellyfin"], ("umbrelarr", "sonarr"))
         self.assertTrue(CORE_MODULES <= set(selected))
 
-    def test_every_starting_profile_is_valid_and_keeps_the_required_core(self):
-        profiles = {profile.id: profile for profile in STACK_PROFILES}
-        self.assertEqual(
-            set(profiles),
-            {"core", "tv-torrent", "video-usenet", "full", "jellyfin-video", "plex-video"},
-        )
-        for profile in profiles.values():
-            selected = normalize_modules(profile.enabled_services)
-            self.assertTrue(CORE_MODULES <= selected, profile.id)
-            self.assertEqual(validate_modules(selected), [], profile.id)
-        self.assertEqual(
-            normalize_modules(profiles["tv-torrent"].enabled_services),
-            frozenset({"umbrelarr", "prowlarr", "qbittorrent", "sonarr"}),
-        )
-        self.assertNotIn("jellyfin", normalize_modules(profiles["full"].enabled_services))
-        self.assertNotIn("plex", normalize_modules(profiles["full"].enabled_services))
-
     def test_selected_modules_limit_read_only_detection(self):
+        active_modules = self.reconciler.enabled_modules
         snapshot = self.reconciler.select_and_detect(
             ["prowlarr", "sonarr", "qbittorrent"], "direct",
         )
         self.assertEqual(snapshot["vpnProvider"], "direct")
+        self.assertNotIn("profiles", snapshot)
         self.assertEqual(snapshot["requiredCount"], 3)
         self.assertEqual(
             {item["id"] for item in snapshot["apps"]},
             {"prowlarr", "sonarr", "qbittorrent"},
         )
-        self.assertNotIn("privado-vpn", self.reconciler.enabled_modules)
+        self.assertIn("privado-vpn", self.reconciler.enabled_modules)
+        self.assertEqual(self.reconciler.enabled_modules, active_modules)
+        self.assertNotIn("privado-vpn", snapshot["enabledServices"])
+        self.assertTrue(snapshot["configurationChanged"])
         requests = [call for call in self.client.calls if call[0] == "request"]
         self.assertEqual(len(requests), 3)
         self.assertTrue(all(call[1] == "GET" for call in requests))
@@ -387,6 +1526,124 @@ class ReconcilerTests(unittest.TestCase):
         ]
         self.assertEqual(len(mutations), 4)
         self.assertTrue(all(call[5] == {"X-Emby-Token": "jellyfin-key"} for call in mutations))
+
+    def test_jellyfin_bootstrap_reuses_one_named_key_without_exposing_secrets(self):
+        client = JellyfinBootstrapClient(keys=[{
+            "Name": "umbrelarr",
+            "AccessToken": "existing-dedicated-private-key",
+        }])
+        reconciler, before, jellyfin = self.jellyfin_bootstrap_reconciler(client)
+        self.assertEqual(jellyfin["action"], "create_api_key")
+        module = next(item for item in before["modules"] if item["id"] == "jellyfin")
+        self.assertEqual(module["credentialSetup"], "jellyfin_admin")
+
+        snapshot = reconciler.bootstrap_credential(
+            "jellyfin", "admin", "private-password",
+        )
+
+        self.assertEqual(client.created, 0)
+        self.assertEqual(client.logged_out, 1)
+        self.assertEqual(
+            reconciler.settings.key("jellyfin"),
+            "existing-dedicated-private-key",
+        )
+        module = next(item for item in snapshot["modules"] if item["id"] == "jellyfin")
+        self.assertEqual(module["credentialSource"], "service_api")
+        self.assertTrue(module["credentialConfigured"])
+        self.assertNotIn("private-password", str(snapshot))
+        self.assertNotIn("private-admin-session", str(snapshot))
+        self.assertNotIn("existing-dedicated-private-key", str(snapshot))
+        self.assertIn(
+            "Jellyfin API key connected through its administrator API",
+            str(reconciler.runtime.snapshot()["events"]),
+        )
+
+    def test_jellyfin_bootstrap_creates_and_validates_a_missing_named_key(self):
+        client = JellyfinBootstrapClient()
+        reconciler, _before, jellyfin = self.jellyfin_bootstrap_reconciler(client)
+        self.assertEqual(jellyfin["action"], "create_api_key")
+        self.assertFalse(any(
+            call[0] == "json" and call[1] == "POST" and "/Auth/Keys" in call[2]
+            for call in client.calls
+        ), "ordinary detection must not create service credentials")
+
+        snapshot = reconciler.bootstrap_credential(
+            "jellyfin", "admin", "private-password",
+        )
+
+        self.assertEqual(client.created, 1)
+        self.assertEqual(client.logged_out, 1)
+        self.assertEqual(reconciler.settings.key("jellyfin"), "dedicated-key-1")
+        detected = next(item for item in snapshot["apps"] if item["id"] == "jellyfin")
+        self.assertTrue(detected["credentials"])
+        self.assertEqual(detected["action"], "none")
+        self.assertIn("created and verified", detected["detail"])
+        create_calls = [
+            call for call in client.calls
+            if call[1] == "POST" and "/Auth/Keys?app=umbrelarr" in call[2]
+        ]
+        self.assertEqual(len(create_calls), 1)
+
+    def test_jellyfin_bootstrap_rejects_invalid_or_non_admin_login_safely(self):
+        invalid = JellyfinBootstrapClient(reject_login=True)
+        reconciler, _snapshot, _jellyfin = self.jellyfin_bootstrap_reconciler(invalid)
+        with self.assertRaisesRegex(ValueError, "rejected the administrator") as context:
+            reconciler.bootstrap_credential(
+                "jellyfin", "admin", "private-password",
+            )
+        self.assertNotIn("private-password", str(context.exception))
+        self.assertNotIn("private-admin-session", str(context.exception))
+        self.assertEqual(reconciler.settings.key("jellyfin"), "")
+
+        non_admin = JellyfinBootstrapClient(administrator=False)
+        reconciler, _snapshot, _jellyfin = self.jellyfin_bootstrap_reconciler(non_admin)
+        with self.assertRaisesRegex(ValueError, "administrator account"):
+            reconciler.bootstrap_credential(
+                "jellyfin", "viewer", "private-password",
+            )
+        self.assertEqual(non_admin.created, 0)
+        self.assertEqual(non_admin.logged_out, 1)
+        self.assertEqual(reconciler.settings.key("jellyfin"), "")
+
+    def test_jellyfin_bootstrap_rejects_duplicates_and_network_failure_without_leaks(self):
+        duplicate = JellyfinBootstrapClient(keys=[
+            {"Name": "umbrelarr", "AccessToken": "private-key-one"},
+            {"AppName": "Umbrelarr", "AccessToken": "private-key-two"},
+        ])
+        reconciler, _snapshot, _jellyfin = self.jellyfin_bootstrap_reconciler(duplicate)
+        with self.assertRaisesRegex(ValueError, "multiple API keys") as context:
+            reconciler.bootstrap_credential(
+                "jellyfin", "admin", "private-password",
+            )
+        self.assertNotIn("private-key", str(context.exception))
+        self.assertEqual(duplicate.logged_out, 1)
+
+        unavailable = JellyfinBootstrapClient(fail_key_list=True, fail_logout=True)
+        reconciler, _snapshot, _jellyfin = self.jellyfin_bootstrap_reconciler(unavailable)
+        with self.assertRaisesRegex(RuntimeError, "could not list its API keys") as context:
+            reconciler.bootstrap_credential(
+                "jellyfin", "admin", "private-password",
+            )
+        self.assertNotIn("private-admin-session", str(context.exception))
+        self.assertEqual(unavailable.logged_out, 1)
+        self.assertEqual(reconciler.settings.key("jellyfin"), "")
+
+    def test_jellyfin_bootstrap_rejects_a_configured_invalid_environment_key(self):
+        client = JellyfinBootstrapClient()
+        reconciler, snapshot, jellyfin = self.jellyfin_bootstrap_reconciler(
+            client, "stale-environment-private-key",
+        )
+        self.assertEqual(jellyfin["action"], "invalid_credentials")
+        module = next(item for item in snapshot["modules"] if item["id"] == "jellyfin")
+        self.assertTrue(module["environmentCredentialConfigured"])
+
+        with self.assertRaisesRegex(ValueError, "UMBREL_ARR_JELLYFIN_API_KEY") as context:
+            reconciler.bootstrap_credential(
+                "jellyfin", "admin", "private-password",
+            )
+
+        self.assertNotIn("stale-environment-private-key", str(context.exception))
+        self.assertFalse(any("/Users/AuthenticateByName" in call[2] for call in client.calls))
 
     def test_plex_reconciliation_creates_only_named_owned_libraries(self):
         values = environment(self.temp.name)
@@ -469,6 +1726,10 @@ class ReconcilerTests(unittest.TestCase):
         client.tags.extend({"id": index + 1, "label": label} for index, label in enumerate(labels))
         reconciler = Reconciler(Settings(environment(self.temp.name)), client)
         self.assertTrue(reconciler.ensure_setup_ready())
+        active_modules = set(reconciler.enabled_modules)
+        active_services = {
+            item["id"] for item in reconciler.runtime.snapshot()["services"]
+        }
 
         snapshot = reconciler.select_and_detect(["prowlarr", "sonarr"], "direct")
 
@@ -476,6 +1737,147 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(snapshot["phase"], "ready")
         self.assertTrue(snapshot["canConfirm"])
         self.assertEqual(snapshot["vpnProvider"], "direct")
+        self.assertEqual(set(snapshot["activeEnabledServices"]), active_modules)
+        modules = {item["id"]: item for item in snapshot["modules"]}
+        self.assertTrue(modules["sonarr"]["active"])
+        self.assertTrue(modules["sonarr"]["enabled"])
+        self.assertTrue(modules["privado-vpn"]["active"])
+        self.assertFalse(modules["privado-vpn"]["enabled"])
+        self.assertEqual(reconciler.enabled_modules, active_modules)
+        self.assertEqual(reconciler.vpn_provider.id, "privado")
+        self.assertEqual(
+            {item["id"] for item in reconciler.runtime.snapshot()["services"]},
+            active_services,
+        )
+
+        cancelled = reconciler.cancel_selection_change()
+        self.assertEqual(cancelled["phase"], "confirmed")
+        self.assertFalse(cancelled["configurationChanged"])
+        self.assertEqual(reconciler.enabled_modules, active_modules)
+
+        reconciler.select_and_detect(["prowlarr", "sonarr"], "direct")
+        reconciler.reconcile_async = lambda: True
+        applied = reconciler.confirm_setup(
+            "local", enabled_services=["prowlarr", "sonarr"], vpn_provider="direct",
+        )
+        self.assertEqual(applied["phase"], "confirmed")
+        self.assertEqual(reconciler.enabled_modules, {"umbrelarr", "prowlarr", "sonarr"})
+        self.assertEqual(reconciler.vpn_provider.id, "direct")
+        marker_labels = {item["label"] for item in client.tags}
+        self.assertIn(f"{MODULE_MARKER_PREFIX}sonarr", marker_labels)
+        self.assertNotIn(f"{MODULE_MARKER_PREFIX}privado-vpn", marker_labels)
+
+    def test_optional_service_can_be_removed_without_touching_the_installed_app(self):
+        reconciler, client = self.confirmed_reconciler(
+            ["umbrelarr", "prowlarr", "qbittorrent"],
+        )
+
+        snapshot = reconciler.remove_service("qbittorrent")
+
+        self.assertEqual(reconciler.enabled_modules, CORE_MODULES)
+        self.assertEqual(set(snapshot["activeEnabledServices"]), CORE_MODULES)
+        self.assertNotIn(
+            f"{MODULE_MARKER_PREFIX}qbittorrent",
+            {item["label"] for item in client.tags},
+        )
+        app_mutations = [
+            call for call in client.calls
+            if call[0] == "json"
+            and call[1] in {"POST", "PUT", "DELETE"}
+            and "/api/v1/tag" not in call[2]
+        ]
+        self.assertEqual(app_mutations, [])
+        self.assertTrue(any(
+            "Stopped managing qBittorrent" in event["message"]
+            for event in reconciler.runtime.snapshot()["events"]
+        ))
+
+    def test_removing_privado_switches_the_managed_provider_to_direct(self):
+        reconciler, client = self.confirmed_reconciler(
+            ["umbrelarr", "prowlarr", "privado-vpn"], "privado",
+        )
+
+        snapshot = reconciler.remove_service("privado-vpn")
+
+        self.assertEqual(reconciler.vpn_provider.id, "direct")
+        self.assertEqual(set(snapshot["activeEnabledServices"]), CORE_MODULES)
+        labels = {item["label"] for item in client.tags}
+        self.assertIn(f"{VPN_PROVIDER_MARKER_PREFIX}direct", labels)
+        self.assertNotIn(f"{VPN_PROVIDER_MARKER_PREFIX}privado", labels)
+        self.assertNotIn(f"{MODULE_MARKER_PREFIX}privado-vpn", labels)
+
+    def test_removal_rejects_required_services_and_dependency_breakage(self):
+        reconciler, client = self.confirmed_reconciler([
+            "umbrelarr", "prowlarr", "sonarr", "radarr", "bazarr",
+        ])
+        labels = {item["label"] for item in client.tags}
+
+        with self.assertRaisesRegex(ValueError, "required by umbrelarr"):
+            reconciler.remove_service("prowlarr")
+        with self.assertRaisesRegex(ValueError, "Remove the dependent service first"):
+            reconciler.remove_service("sonarr")
+
+        self.assertIn("sonarr", reconciler.enabled_modules)
+        self.assertEqual({item["label"] for item in client.tags}, labels)
+
+    def test_failed_marker_write_keeps_the_service_in_the_active_fleet(self):
+        reconciler, client = self.confirmed_reconciler(
+            ["umbrelarr", "prowlarr", "qbittorrent"],
+            client=FailingTagDeleteClient(),
+        )
+        active_runtime = reconciler.runtime
+
+        with self.assertRaisesRegex(RuntimeError, "marker update failed"):
+            reconciler.remove_service("qbittorrent")
+
+        self.assertIn("qbittorrent", reconciler.enabled_modules)
+        self.assertIs(reconciler.runtime, active_runtime)
+        self.assertIn(
+            f"{MODULE_MARKER_PREFIX}qbittorrent",
+            {item["label"] for item in client.tags},
+        )
+
+    def test_failed_later_addition_keeps_the_active_fleet_and_markers(self):
+        client = QbitAuthClient(active_password="different-password")
+        labels = [
+            SETUP_MARKER_TAG,
+            SETUP_READY_MARKER_TAG,
+            MODULE_CATALOG_MARKER_TAG,
+            f"{VPN_PROVIDER_MARKER_PREFIX}direct",
+            f"{MODULE_MARKER_PREFIX}umbrelarr",
+            f"{MODULE_MARKER_PREFIX}prowlarr",
+            f"{MODULE_MARKER_PREFIX}sonarr",
+        ]
+        client.tags.extend(
+            {"id": index + 1, "label": label}
+            for index, label in enumerate(labels)
+        )
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+        self.assertTrue(reconciler.ensure_setup_ready())
+        active_modules = reconciler.enabled_modules
+        active_runtime = reconciler.runtime
+
+        reviewed = reconciler.select_and_detect(
+            ["prowlarr", "sonarr", "qbittorrent"], "direct",
+        )
+        self.assertTrue(reviewed["canConfirm"])
+        with self.assertRaisesRegex(ValueError, "one-time admin password"):
+            reconciler.confirm_setup(
+                "local",
+                qbittorrent_temporary_password="wrong-password",
+                enabled_services=["prowlarr", "sonarr", "qbittorrent"],
+                vpn_provider="direct",
+            )
+
+        self.assertEqual(reconciler.enabled_modules, active_modules)
+        self.assertIs(reconciler.runtime, active_runtime)
+        self.assertNotIn(
+            f"{MODULE_MARKER_PREFIX}qbittorrent",
+            {item["label"] for item in client.tags},
+        )
+        retry = reconciler.setup_snapshot()
+        self.assertTrue(retry["configurationChanged"])
+        self.assertEqual(retry["phase"], "ready")
 
     def test_reconciliation_is_blocked_until_explicit_setup(self):
         snapshot = self.reconciler.setup_snapshot()
@@ -493,16 +1895,45 @@ class ReconcilerTests(unittest.TestCase):
         self.assertTrue(snapshot["canConfirm"])
         self.assertEqual(snapshot["detectedCount"], len(REQUIRED_APPS))
         requests = [call for call in self.client.calls if call[0] == "request"]
-        self.assertEqual(len(requests), len(REQUIRED_APPS))
+        self.assertGreaterEqual(len(requests), len(REQUIRED_APPS))
         self.assertTrue(all(call[1] == "GET" for call in requests))
         self.assertFalse(any(call[1] in {"POST", "PUT", "DELETE"} for call in self.client.calls))
         self.assertTrue(all({"reachable", "credentials", "action"} <= item.keys() for item in snapshot["apps"]))
 
-    def test_confirmation_rejects_missing_storage_choice(self):
+    def test_detection_rejects_a_stale_api_key_before_apply(self):
+        original = self.client.json
+
+        def json_call(method, url, api_key=None, payload=None, headers=None):
+            if url.endswith("/api/v3/system/status"):
+                raise RequestError("Unauthorized", 401)
+            return original(method, url, api_key, payload, headers)
+
+        self.client.json = json_call
+        snapshot = self.reconciler.select_and_detect(
+            ["prowlarr", "sonarr"], "direct",
+        )
+
+        self.assertFalse(snapshot["canConfirm"])
+        sonarr = next(item for item in snapshot["apps"] if item["id"] == "sonarr")
+        self.assertTrue(sonarr["reachable"])
+        self.assertFalse(sonarr["credentials"])
+        self.assertEqual(sonarr["action"], "invalid_credentials")
+        self.assertIn("rejected", sonarr["detail"])
+        with self.assertRaisesRegex(ValueError, "Resolve these service connections"):
+            self.reconciler.confirm_setup(
+                "local", enabled_services=["prowlarr", "sonarr"],
+                vpn_provider="direct",
+            )
+
+    def test_confirmation_detects_storage_when_no_choice_is_submitted(self):
         self.reconciler.detect_apps()
-        with self.assertRaisesRegex(ValueError, "Choose local"):
-            self.reconciler.confirm_setup()
-        self.assertFalse(any(item.get("label") == SETUP_MARKER_TAG for item in self.client.tags))
+        self.reconciler.reconcile_async = lambda: True
+
+        snapshot = self.reconciler.confirm_setup()
+
+        self.assertTrue(snapshot["confirmed"])
+        self.assertEqual(self.reconciler.storage.snapshot()["mode"], "local")
+        self.assertTrue(any(item.get("label") == SETUP_MARKER_TAG for item in self.client.tags))
 
     def test_confirmation_rejects_missing_generated_api_key(self):
         values = environment(self.temp.name)
@@ -511,7 +1942,7 @@ class ReconcilerTests(unittest.TestCase):
         snapshot = reconciler.detect_apps()
         self.assertFalse(snapshot["canConfirm"])
         sonarr = next(item for item in snapshot["apps"] if item["id"] == "sonarr")
-        self.assertIn("Restart umbrelarr", sonarr["detail"])
+        self.assertIn("generated API key", sonarr["detail"])
         with self.assertRaisesRegex(ValueError, "Sonarr"):
             reconciler.confirm_setup("local")
 
@@ -771,6 +2202,105 @@ class ReconcilerTests(unittest.TestCase):
         event = self.reconciler.runtime.snapshot()["events"][0]["message"]
         self.assertIn("applied through service APIs", event)
 
+    def test_individual_library_save_preserves_every_other_root(self):
+        self.reconciler.reconcile_async = lambda: True
+        self.reconciler._setup_complete = True
+        self.reconciler._setup_ready = True
+        self.reconciler.save_storage("local", {})
+
+        snapshot = self.reconciler.save_library_storage("sonarr", "network")
+
+        self.assertEqual(snapshot["mode"], "adopted")
+        self.assertEqual(snapshot["roots"]["sonarr"], NETWORK_ROOTS["sonarr"])
+        for slug, path in LOCAL_ROOTS.items():
+            if slug != "sonarr":
+                self.assertEqual(snapshot["roots"][slug], path)
+        library = next(item for item in snapshot["libraries"] if item["key"] == "sonarr")
+        self.assertEqual(library["source"], "network")
+        self.assertEqual(library["rootId"], 2)
+        self.assertEqual(len(library["candidates"]), 2)
+        self.assertIn("Sonarr library root updated", self.reconciler.runtime.snapshot()["events"][0]["message"])
+
+    def test_individual_library_can_adopt_only_a_reported_existing_root(self):
+        self.reconciler.reconcile_async = lambda: True
+        self.reconciler._setup_complete = True
+        self.reconciler._setup_ready = True
+        self.reconciler.save_storage("local", {})
+        radarr_url = self.reconciler.settings.url("radarr")
+        self.client.roots[radarr_url].append({"id": 2, "path": "/media/movies"})
+
+        snapshot = self.reconciler.save_library_storage("radarr", "existing", 2)
+
+        library = next(item for item in snapshot["libraries"] if item["key"] == "radarr")
+        self.assertEqual(library["source"], "existing")
+        self.assertEqual(library["root"], "/media/movies")
+        self.assertEqual(snapshot["roots"]["sonarr"], LOCAL_ROOTS["sonarr"])
+        with self.assertRaisesRegex(ValueError, "not available"):
+            self.reconciler.save_library_storage("radarr", "existing", 999)
+
+    def test_library_filesystem_browser_normalizes_folders_and_checks_all_arrs(self):
+        sonarr_url = self.reconciler.settings.url("sonarr")
+        self.client.filesystems[sonarr_url] = {
+            "/media": {
+                "parent": "/",
+                "directories": [
+                    {"name": "Zeta", "path": "/media/Zeta/"},
+                    {"Name": "alpha", "Path": "/media/alpha"},
+                    {"name": "Relative", "path": "relative"},
+                ],
+            },
+        }
+
+        snapshot = self.reconciler.browse_library_filesystem("sonarr", "/media")
+
+        self.assertEqual(snapshot["path"], "/media")
+        self.assertEqual(snapshot["parent"], "/")
+        self.assertEqual(
+            snapshot["directories"],
+            [
+                {"name": "alpha", "path": "/media/alpha"},
+                {"name": "Zeta", "path": "/media/Zeta"},
+            ],
+        )
+        self.assertEqual(len(snapshot["mounts"]), 5)
+        self.assertTrue(snapshot["allMounted"])
+        filesystem_calls = [
+            call for call in self.client.calls
+            if call[0] == "json" and "/filesystem?" in call[2]
+        ]
+        self.assertEqual(len(filesystem_calls), 5)
+        self.assertTrue(all("includeFiles=false" in call[2] for call in filesystem_calls))
+
+    def test_library_filesystem_browser_reports_service_errors_safely(self):
+        sonarr_url = self.reconciler.settings.url("sonarr")
+        self.client.filesystems[sonarr_url] = {
+            "/missing": RequestError("filesystem unavailable", 503),
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unable to browse Sonarr"):
+            self.reconciler.browse_library_filesystem("sonarr", "/missing")
+
+    def test_individual_library_rejects_a_path_missing_from_another_arr(self):
+        self.reconciler.reconcile_async = lambda: True
+        self.reconciler._setup_complete = True
+        self.reconciler._setup_ready = True
+        self.reconciler.save_storage("local", {})
+        with self.assertRaisesRegex(ValueError, "Choose a system folder"):
+            self.reconciler.save_library_storage("sonarr", "custom", path="")
+        selected_path = "/media/shows"
+        radarr_url = self.reconciler.settings.url("radarr")
+        self.client.filesystems[radarr_url] = {
+            selected_path: RequestError("Path is not mounted", 404),
+        }
+
+        with self.assertRaisesRegex(ValueError, "same path in every managed media service; check Radarr"):
+            self.reconciler.save_library_storage(
+                "sonarr", "custom", path=selected_path,
+            )
+
+        snapshot = self.reconciler.storage_snapshot()
+        self.assertEqual(snapshot["roots"]["sonarr"], LOCAL_ROOTS["sonarr"])
+
     def test_qbittorrent_configures_proxy_and_five_categories(self):
         detail = self.reconciler.configure_qbittorrent(True)
         forms = [call for call in self.client.calls if call[0] == "form"]
@@ -994,6 +2524,51 @@ class StateTests(unittest.TestCase):
         services = {service["id"]: service for service in state.snapshot()["services"]}
         self.assertEqual(services["client"]["waitingOn"], [])
 
+    def test_runtime_state_keeps_bounded_check_history(self):
+        state = RuntimeState([ServiceStatus("one", "One", role="control_plane")])
+        for index in range(30):
+            state.set("one", "healthy" if index % 2 else "waiting", f"Check {index}")
+        service = state.snapshot()["services"][0]
+        self.assertEqual(service["role"], "control_plane")
+        self.assertEqual(len(service["checks"]), 24)
+        self.assertEqual(service["checks"][-1]["status"], "healthy")
+
+    def test_runtime_state_exposes_authenticated_resource_snapshots(self):
+        state = RuntimeState([ServiceStatus("one", "One")])
+        state.set_container("one", {
+            "state": "running", "health": "healthy", "updatedAt": 41,
+        })
+        state.set_resources("one", {"updatedAt": 42, "cpu": {"percent": 31}})
+        service = state.snapshot()["services"][0]
+        self.assertEqual(service["container"]["state"], "running")
+        self.assertEqual(service["resources"]["updatedAt"], 42)
+        self.assertEqual(service["resources"]["cpu"]["percent"], 31)
+
+    def test_runtime_state_retains_last_real_resource_sample(self):
+        state = RuntimeState([ServiceStatus("one", "One")])
+        state.set_resources("one", {
+            "source": "docker",
+            "updatedAt": 42,
+            "sampleState": "current",
+            "cpu": {"percent": 31},
+        })
+
+        state.retain_resources("one")
+
+        resources = state.snapshot()["services"][0]["resources"]
+        self.assertEqual(resources["sampleState"], "last_sample")
+        self.assertEqual(resources["updatedAt"], 42)
+        self.assertEqual(resources["cpu"]["percent"], 31)
+
+    def test_runtime_state_does_not_invent_a_resource_sample_timestamp(self):
+        state = RuntimeState([ServiceStatus("one", "One")])
+
+        state.retain_resources("one")
+
+        resources = state.snapshot()["services"][0]["resources"]
+        self.assertEqual(resources["sampleState"], "unavailable")
+        self.assertNotIn("updatedAt", resources)
+
     def test_storage_is_derived_from_api_root_ids_without_files(self):
         storage = StorageSettings()
         storage.set_enabled_modules({*LOCAL_ROOTS, "jellyfin", "plex"})
@@ -1006,6 +2581,9 @@ class StateTests(unittest.TestCase):
         self.assertEqual(snapshot["roots"], NETWORK_ROOTS)
         self.assertFalse(snapshot["actionRequired"])
         self.assertEqual(len(snapshot["libraries"]), 5)
+        self.assertEqual(snapshot["libraries"][0]["source"], "network")
+        self.assertEqual(snapshot["libraries"][0]["rootId"], 10)
+        self.assertEqual(snapshot["libraries"][0]["candidates"], folders["sonarr"])
         self.assertIn("overseerr", LIBRARY_DEFINITIONS["radarr-4k"]["apps"])
         self.assertIn("jellyfin", snapshot["libraries"][0]["apps"])
         self.assertIn("plex", snapshot["libraries"][0]["apps"])
@@ -1049,16 +2627,20 @@ class ApiKeyResolverTests(unittest.TestCase):
         self.write("overseerr/settings.json", json.dumps({"main": {"apiKey": "overseerr-generated-key-123456"}}))
         jellyfin_db = self.root / "jellyfin/data/jellyfin.db"
         jellyfin_db.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(jellyfin_db) as connection:
-            connection.execute('CREATE TABLE "ApiKeys" ("Name" TEXT, "AccessToken" TEXT)')
-            connection.execute(
-                'INSERT INTO "ApiKeys" ("Name", "AccessToken") VALUES (?, ?)',
-                ("another-app", "do-not-adopt-this-key"),
-            )
-            connection.execute(
-                'INSERT INTO "ApiKeys" ("Name", "AccessToken") VALUES (?, ?)',
-                ("umbrelarr", "jellyfin-generated-key-123456"),
-            )
+        connection = sqlite3.connect(jellyfin_db)
+        try:
+            with connection:
+                connection.execute('CREATE TABLE "ApiKeys" ("Name" TEXT, "AccessToken" TEXT)')
+                connection.execute(
+                    'INSERT INTO "ApiKeys" ("Name", "AccessToken") VALUES (?, ?)',
+                    ("another-app", "do-not-adopt-this-key"),
+                )
+                connection.execute(
+                    'INSERT INTO "ApiKeys" ("Name", "AccessToken") VALUES (?, ?)',
+                    ("umbrelarr", "jellyfin-generated-key-123456"),
+                )
+        finally:
+            connection.close()
         self.write(
             "plex/Library/Application Support/Plex Media Server/Preferences.xml",
             '<Preferences FriendlyName="Umbrel" PlexOnlineToken="plex-generated-token-123456"/>',
@@ -1091,66 +2673,97 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("aria-label=\"Stack summary\"", PAGE)
         self.assertIn("aria-label=\"Primary navigation\"", PAGE)
         self.assertIn('href="/libraries"', PAGE)
+        self.assertNotIn('href="/dependencies"', PAGE)
+        self.assertNotIn('class="nav-label"', PAGE)
         self.assertIn("Reconcile", PAGE)
         self.assertIn("@media (max-width: 560px)", PAGE)
         for status in ("unknown", "waiting", "action_required", "configuring", "healthy", "failed"):
             self.assertIn(status, PAGE)
-        self.assertIn("--sidebar: #20242a", PAGE)
-        self.assertIn("--canvas: #f5f6f8", PAGE)
-        self.assertIn("--primary: #2e8b57", PAGE)
+        self.assertIn("color-scheme: dark", PAGE)
+        self.assertIn("--sidebar: #070b10", PAGE)
+        self.assertIn("--canvas: #0a0f15", PAGE)
+        self.assertIn("--primary: #50d890", PAGE)
+        self.assertIn('class="nav-icon" aria-hidden="true"><svg', PAGE)
         self.assertNotIn("radial-gradient", PAGE)
         self.assertIn("border-radius: 10px", PAGE)
         self.assertIn("prefers-reduced-motion", PAGE)
+        self.assertIn("/service-icons/", PAGE)
+        self.assertIn("service.id==='umbrelarr'?'/icon.png'", PAGE)
+        self.assertIn("Resources", PAGE)
+        self.assertIn('role="meter" aria-valuemin="0"', PAGE)
+        self.assertNotIn("API-derived health · 24-check window", PAGE)
+        self.assertIn("chooseService", PAGE)
+        self.assertIn("showModal", PAGE)
+        self.assertIn("data-module-action", PAGE)
 
     def test_dashboard_routes_render_only_their_task(self):
-        setup = render_page("setup")
         services = render_page("services")
-        service = render_page("service", service_id="sonarr")
-        dependencies = render_page("dependencies")
         libraries = render_page("libraries")
         activity = render_page("activity")
-        self.assertIn('id="detectApps"', setup)
-        self.assertIn('id="confirmSetup"', setup)
-        self.assertIn("does not create containers", setup)
-        self.assertIn('aria-current="page" href="/setup"', setup)
+        with self.assertRaises(ValueError):
+            render_page("setup")
+        with self.assertRaises(ValueError):
+            render_page("dependencies")
+        self.assertNotIn('href="/setup"', services)
         self.assertIn('id="serviceGrid"', services)
         self.assertIn('id="serviceSearch"', services)
+        self.assertIn('id="manageServices"', services)
+        self.assertIn('id="serviceManager"', services)
+        self.assertIn('id="detectApps"', services)
+        self.assertIn('id="confirmSetup"', services)
+        self.assertIn('id="cancelServiceChanges"', services)
+        self.assertIn('id="removeServiceDialog"', services)
+        self.assertIn('id="confirmRemoveService"', services)
+        self.assertIn('data-remove-service', services)
+        self.assertIn('/api/setup/remove', services)
+        self.assertIn("Add one service", services)
+        self.assertIn('aria-haspopup="dialog"', services)
+        self.assertIn("Choose one installed service", services)
+        self.assertIn('id="directConnections"', services)
+        self.assertIn('id="jellyfinCredentialBootstrap"', services)
+        self.assertIn('id="bootstrapJellyfinCredential"', services)
+        self.assertIn('/api/setup/credentials/bootstrap', services)
+        self.assertIn('Connected automatically', services)
+        self.assertNotIn("Continue on Umbrel", services)
+        self.assertNotIn('id="stackProfile"', services)
+        self.assertNotIn("Routing and storage", services)
+        self.assertNotIn('id="vpnProvider"', services)
+        self.assertNotIn("Add or remove services", services)
+        self.assertNotIn("does not uninstall the app or delete that app's settings", services)
         self.assertNotIn('/api/containers', services)
         self.assertNotIn('<tbody id="serviceRows">', services)
         self.assertNotIn('href="/containers"', services)
         self.assertNotIn('id="storageForm"', services)
-        self.assertIn('data-service-id="sonarr"', service)
-        self.assertIn('id="detailDependencies"', service)
-        self.assertNotIn('id="containerLogs"', service)
-        self.assertIn('aria-current="page" href="/services"', service)
-        self.assertIn('id="dependencyGraph"', dependencies)
-        self.assertIn('id="dependencyRows"', dependencies)
-        self.assertNotIn('id="serviceGrid"', dependencies)
-        self.assertIn('id="storageForm"', libraries)
-        self.assertIn('id="libraryPlan"', libraries)
-        self.assertIn("Reconcile scope", libraries)
-        self.assertIn("Save library layout", libraries)
+        self.assertNotIn('href="/services/${encodeURIComponent(service.id)}"', services)
+        self.assertIn('id="libraryGrid"', libraries)
+        self.assertIn("Your media libraries", libraries)
+        self.assertNotIn("Configuration level", libraries)
+        self.assertNotIn("Basic", libraries)
+        self.assertNotIn("Expert", libraries)
         self.assertNotIn("Apply libraries to managed apps", libraries)
         self.assertNotIn('id="serviceGrid"', libraries)
         self.assertIn('id="events"', activity)
         self.assertNotIn('id="storageForm"', activity)
 
-    def test_unknown_service_detail_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Unknown managed service"):
-            render_page("service", service_id="not-owned")
-
-    def test_library_settings_have_basic_and_expert_modes(self):
-        basic = render_page("libraries", "basic")
-        expert = render_page("libraries", "expert")
-        self.assertIn("Basic mode applies a complete, safe five-library layout", basic)
-        self.assertIn('data-level="basic"', basic)
-        self.assertIn('value="adopt"', basic)
-        self.assertIn('id="storageRootSelections"', basic)
-        self.assertIn('aria-current="page" href="/libraries"', basic)
-        self.assertIn("Expert mode can adopt one existing API-reported root ID", expert)
-        self.assertIn('data-level="expert"', expert)
-        self.assertNotIn('name="sonarr" required', expert)
-        self.assertNotIn("/api/containers", expert)
+    def test_library_detail_exposes_complete_per_library_configuration(self):
+        detail = render_page("library", library_id="tv")
+        self.assertIn('data-library-id="tv"', detail)
+        self.assertIn('id="libraryForm"', detail)
+        self.assertIn('name="librarySource" value="local"', detail)
+        self.assertIn('name="librarySource" value="network"', detail)
+        self.assertIn('name="librarySource" value="custom"', detail)
+        self.assertIn('id="libraryBrowser"', detail)
+        self.assertIn('id="libraryMountCheck"', detail)
+        self.assertIn('id="libraryPath"', detail)
+        self.assertNotIn('id="libraryRootId"', detail)
+        self.assertNotIn("API only", detail)
+        self.assertNotIn("Choose where this library lives", detail)
+        self.assertIn("Managed configuration", detail)
+        self.assertIn('aria-current="page" href="/libraries"', detail)
+        self.assertNotIn("Basic", detail)
+        self.assertNotIn("Expert", detail)
+        with self.assertRaisesRegex(ValueError, "Unknown managed library"):
+            render_page("library", library_id="not-owned")
 
 
 class ImageTests(unittest.TestCase):
@@ -1159,13 +2772,18 @@ class ImageTests(unittest.TestCase):
         self.assertIn("adduser -S -D -H -u 1000", dockerfile)
         self.assertIn("USER umbrelarr", dockerfile)
 
-    def test_control_plane_has_no_docker_socket_or_persistent_state(self):
+    def test_web_control_plane_has_no_docker_socket_or_persistent_state(self):
         dockerfile = (ROOT / "Dockerfile").read_text()
         app = (ROOT / "app" / "app.py").read_text()
+        broker = (ROOT / "app" / "docker_inventory.py").read_text()
         self.assertNotIn("/data", dockerfile)
         self.assertNotIn("STATE_DIR", dockerfile)
         self.assertIn("PYTHONDONTWRITEBYTECODE=1", dockerfile)
-        self.assertNotIn("containers", app)
+        self.assertIn("docker_inventory.py", dockerfile)
+        self.assertIn("COPY app/service-icons ./service-icons", dockerfile)
+        self.assertNotIn("docker.sock", dockerfile)
+        self.assertNotIn("DockerEngineClient", app)
+        self.assertIn("class DockerInventory", broker)
         self.assertFalse((ROOT / "app" / "containers.py").exists())
         self.assertFalse((ROOT / "compose.local.yml").exists())
 

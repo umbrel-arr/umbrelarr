@@ -152,6 +152,14 @@ class StorageSettings:
 
     def snapshot(self):
         with self._lock:
+            def source_for(key):
+                root = self.data["roots"][key]
+                if root == LOCAL_ROOTS[key]:
+                    return "local"
+                if root == NETWORK_ROOTS[key]:
+                    return "network"
+                return "existing"
+
             return {
                 "mode": self.data["mode"],
                 "roots": dict(self.data["roots"]),
@@ -169,6 +177,9 @@ class StorageSettings:
                     {
                         "key": key,
                         "root": self.data["roots"][key],
+                        "rootId": self.data["rootIds"].get(key),
+                        "source": source_for(key),
+                        "candidates": [dict(item) for item in self.data["candidates"].get(key, [])],
                         **definition,
                         "apps": [slug for slug in definition["apps"] if slug in self.enabled_modules],
                     }

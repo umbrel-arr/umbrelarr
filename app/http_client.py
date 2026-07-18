@@ -17,6 +17,7 @@ class Response:
     status: int
     headers: object
     body: bytes
+    url: str = ""
 
     def json(self):
         return json.loads(self.body) if self.body else None
@@ -34,7 +35,12 @@ class HttpClient:
         request = Request(url, data=body, headers=headers or {}, method=method)
         try:
             with urlopen(request, timeout=timeout) as response:
-                return Response(response.status, response.headers, response.read())
+                return Response(
+                    response.status,
+                    response.headers,
+                    response.read(),
+                    response.geturl(),
+                )
         except HTTPError as error:
             detail = error.read(512).decode("utf-8", "replace").strip()
             message = f"HTTP {error.code} from {url}"

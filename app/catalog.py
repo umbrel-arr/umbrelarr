@@ -10,48 +10,68 @@ class ServiceModule:
     requires_api_key: bool = False
     required: bool = False
     default_enabled: bool = True
+    credential_setup: str = "none"
 
     def public(self):
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class StackProfile:
-    id: str
-    name: str
-    description: str
-    enabled_services: tuple[str, ...]
-
-    def public(self):
-        return {
-            "id": self.id,
-            "name": self.name,
-            "description": self.description,
-            "enabledServices": list(self.enabled_services),
-        }
+        value = asdict(self)
+        value["credentialSetup"] = value.pop("credential_setup")
+        return value
 
 
 SERVICE_MODULES = (
     ServiceModule("umbrelarr", "umbrelarr", 30992, "control_plane", required=True),
     # Prowlarr remains the small API-owned state anchor. Umbrelarr stores consent,
     # selected modules, provider choice, and storage markers as Prowlarr tags.
-    ServiceModule("prowlarr", "Prowlarr", 30982, "indexer_manager", True, True),
+    ServiceModule(
+        "prowlarr", "Prowlarr", 30982, "indexer_manager", True, True,
+        credential_setup="generated",
+    ),
     ServiceModule("privado-vpn", "Privado VPN", 30980, "vpn_provider"),
     ServiceModule("flaresolverr", "FlareSolverr", 30981, "challenge_solver"),
     ServiceModule("qbittorrent", "qBittorrent", 30983, "download_client"),
-    ServiceModule("sabnzbd", "SABnzbd", 30984, "download_client", True),
-    ServiceModule("sonarr", "Sonarr", 30985, "media_manager", True),
-    ServiceModule("sonarr-4k", "Sonarr 4K", 30986, "media_manager", True),
-    ServiceModule("radarr", "Radarr", 30987, "media_manager", True),
-    ServiceModule("radarr-4k", "Radarr 4K", 30988, "media_manager", True),
-    ServiceModule("lidarr", "Lidarr", 30993, "media_manager", True),
-    ServiceModule("bazarr", "Bazarr", 30989, "subtitle_manager", True),
-    ServiceModule("overseerr", "Overseerr", 30990, "request_manager", True),
+    ServiceModule(
+        "sabnzbd", "SABnzbd", 30984, "download_client", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "sonarr", "Sonarr", 30985, "media_manager", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "sonarr-4k", "Sonarr 4K", 30986, "media_manager", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "radarr", "Radarr", 30987, "media_manager", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "radarr-4k", "Radarr 4K", 30988, "media_manager", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "lidarr", "Lidarr", 30993, "media_manager", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "bazarr", "Bazarr", 30989, "subtitle_manager", True,
+        credential_setup="generated",
+    ),
+    ServiceModule(
+        "overseerr", "Overseerr", 30990, "request_manager", True,
+        credential_setup="generated",
+    ),
     ServiceModule("profilarr", "Profilarr", 30991, "profile_manager"),
     # Media servers are user-installed official Umbrel apps. Umbrelarr only
     # discovers and configures them when they are explicitly selected.
-    ServiceModule("jellyfin", "Jellyfin", 8096, "media_server", True, default_enabled=False),
-    ServiceModule("plex", "Plex", 32400, "media_server", True, default_enabled=False),
+    ServiceModule(
+        "jellyfin", "Jellyfin", 8096, "media_server", True,
+        default_enabled=False, credential_setup="jellyfin_admin",
+    ),
+    ServiceModule(
+        "plex", "Plex", 32400, "media_server", True,
+        default_enabled=False, credential_setup="existing_token",
+    ),
 )
 
 MODULES = {module.id: module for module in SERVICE_MODULES}
@@ -60,43 +80,6 @@ DEFAULT_MODULES = frozenset(module.id for module in SERVICE_MODULES if module.de
 MEDIA_MODULES = tuple(module.id for module in SERVICE_MODULES if module.role == "media_manager")
 VIDEO_MODULES = tuple(slug for slug in MEDIA_MODULES if slug != "lidarr")
 MEDIA_SERVER_MODULES = tuple(module.id for module in SERVICE_MODULES if module.role == "media_server")
-
-STACK_PROFILES = (
-    StackProfile(
-        "core", "Core only",
-        "Prowlarr and umbrelarr, with no download or media services selected.",
-        ("prowlarr",),
-    ),
-    StackProfile(
-        "tv-torrent", "TV with torrents",
-        "Prowlarr, qBittorrent, and one Sonarr library.",
-        ("prowlarr", "qbittorrent", "sonarr"),
-    ),
-    StackProfile(
-        "video-usenet", "TV and movies with Usenet",
-        "Prowlarr, SABnzbd, Sonarr, and Radarr.",
-        ("prowlarr", "sabnzbd", "sonarr", "radarr"),
-    ),
-    StackProfile(
-        "full", "Complete media stack",
-        "Every supported download, media, subtitle, request, and profile module.",
-        tuple(
-            module.id for module in SERVICE_MODULES
-            if module.default_enabled and module.role not in {"control_plane", "vpn_provider"}
-        ),
-    ),
-    StackProfile(
-        "jellyfin-video", "Jellyfin video stack",
-        "Prowlarr, qBittorrent, Sonarr, Radarr, and an existing Jellyfin server.",
-        ("prowlarr", "qbittorrent", "sonarr", "radarr", "jellyfin"),
-    ),
-    StackProfile(
-        "plex-video", "Plex video stack",
-        "Prowlarr, qBittorrent, Sonarr, Radarr, and an existing Plex server.",
-        ("prowlarr", "qbittorrent", "sonarr", "radarr", "plex"),
-    ),
-)
-
 
 def normalize_modules(values):
     selected = {str(value).strip() for value in values if str(value).strip() in MODULES}
