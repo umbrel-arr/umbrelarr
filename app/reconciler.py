@@ -1144,7 +1144,7 @@ class Reconciler:
                     "action": "docker_unavailable",
                     "detected": False,
                     "detail": f"Docker inventory is unavailable: {inventory_error}",
-                    "link": self.settings.url(slug),
+                    "link": self.settings.external_url(slug),
                     "container": {"state": "unknown", "health": "unknown"},
                 }
             value = containers.get(slug)
@@ -1157,7 +1157,7 @@ class Reconciler:
                     "action": "install_or_start",
                     "detected": False,
                     "detail": "Service is not installed",
-                    "link": self.settings.url(slug),
+                    "link": self.settings.external_url(slug),
                     "container": {"state": "not_installed", "health": "unknown"},
                 }
             container = {
@@ -1175,13 +1175,14 @@ class Reconciler:
                     "action": "start_service",
                     "detected": True,
                     "detail": f"App is installed but its container is {state.replace('_', ' ')}",
-                    "link": self.settings.url(slug),
+                    "link": self.settings.external_url(slug),
                     "container": container,
                 }
         url = self.settings.url(slug)
         reachable = False
         probe_succeeded = False
         credential_action = ""
+        overseerr_initialized = None
         detail = "App was not reachable"
         if url:
             try:
@@ -1196,6 +1197,13 @@ class Reconciler:
                 probe = f"{url}{probes.get(slug, '/')}"
                 response = self.client.request("GET", probe, timeout=3)
                 reachable = True
+                if slug == "overseerr":
+                    try:
+                        public_settings = response.json()
+                    except (TypeError, ValueError):
+                        public_settings = None
+                    if isinstance(public_settings, dict):
+                        overseerr_initialized = public_settings.get("initialized")
                 redirected = urlsplit(getattr(response, "url", "") or probe)
                 if (
                     redirected.hostname == urlsplit(self.settings.external_url(slug)).hostname
@@ -1224,7 +1232,13 @@ class Reconciler:
                 detail = "Enter qBittorrent's one-time password when confirming setup"
         else:
             credentials = slug not in KEYED_APPS or bool(self.settings.key(slug))
-        if credential_action == "direct_connection_required":
+        if slug == "overseerr" and overseerr_initialized is False:
+            credential_action = "complete_sign_in"
+            detail = (
+                "Complete Plex sign-in in Overseerr; its generated API key "
+                "will then be connected automatically"
+            )
+        if credential_action in {"direct_connection_required", "complete_sign_in"}:
             credentials = False
         if reachable and credentials and slug != "qbittorrent":
             try:
@@ -1297,7 +1311,7 @@ class Reconciler:
             "action": action,
             "detected": bool(container) if containers is not None else reachable,
             "detail": detail,
-            "link": self.settings.url(slug),
+            "link": self.settings.external_url(slug),
             "container": container or {},
         }
 

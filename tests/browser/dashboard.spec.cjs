@@ -935,6 +935,43 @@ test('adopts and validates a generated service API key without exposing a fallba
   await expectNoDocumentOverflow(page);
 });
 
+test('hands an uninitialized Overseerr service to its Plex sign-in before adopting its key', async ({ page }) => {
+  const fresh = completeCatalogSetupFixture();
+  const waiting = {
+    ...fresh,
+    phase: 'ready',
+    detectionComplete: true,
+    configurationChanged: true,
+    canConfirm: false,
+    enabledServices: ['umbrelarr', 'prowlarr', 'overseerr'],
+    modules: fresh.modules.map(module => module.id === 'overseerr' ? {
+      ...module,
+      enabled: true,
+      credentialConfigured: true,
+      credentialSource: 'managed_config',
+    } : module),
+    apps: [
+      { id: 'prowlarr', name: 'Prowlarr', reachable: true, credentials: true, action: 'none', detail: 'Connection verified', link: 'http://umbrel.local:30982' },
+      { id: 'overseerr', name: 'Overseerr', reachable: true, credentials: false, action: 'complete_sign_in', detail: 'Complete Plex sign-in in Overseerr; its generated API key will then be connected automatically', link: 'http://umbrel.local:30990' },
+    ],
+  };
+  await page.route('**/api/status', route => route.fulfill({ json: freshStatusFixture() }));
+  await page.route('**/api/setup', route => route.fulfill({ json: waiting }));
+  await page.route('**/api/setup/detect', route => route.fulfill({ json: waiting }));
+
+  await page.goto('/services?add=overseerr');
+
+  const automatic = page.locator('[data-connection-card="overseerr"] .credential-automatic');
+  await expect(automatic).toContainText('Finish sign-in first');
+  await expect(automatic).toContainText('generated API key will be adopted automatically');
+  await expect(page.locator('[data-connection-card="overseerr"] fieldset')).toHaveCount(0);
+  await page.locator('#detectApps').click();
+  await expect(page.locator('#setupApps')).toContainText('Finish sign-in');
+  await expect(page.locator('#setupApps a.open-link')).toHaveAttribute('href', 'http://umbrel.local:30990');
+  await expect(page.locator('#confirmSetup')).toBeHidden();
+  await expectNoDocumentOverflow(page);
+});
+
 test('opens a requested service in the direct Connect step', async ({ page }) => {
   const setup = sabnzbdSetupFixture();
   await page.route('**/api/status', route => route.fulfill({ json: freshStatusFixture() }));

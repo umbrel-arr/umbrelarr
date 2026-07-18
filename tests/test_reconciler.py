@@ -1925,6 +1925,36 @@ class ReconcilerTests(unittest.TestCase):
                 vpn_provider="direct",
             )
 
+    def test_detection_requires_overseerr_plex_sign_in_before_key_validation(self):
+        class UninitializedOverseerrClient(FakeClient):
+            def request(self, method, url, headers=None, body=None, timeout=20):
+                self.calls.append(("request", method, url, headers, body))
+                if url.endswith("/api/v1/settings/public"):
+                    return Response(
+                        200, {"Content-Type": "application/json"},
+                        b'{"initialized":false}', url,
+                    )
+                return Response(200, {}, b"ok", url)
+
+        client = UninitializedOverseerrClient()
+        reconciler = Reconciler(Settings(environment(self.temp.name)), client)
+
+        snapshot = reconciler.detect_apps()
+
+        overseerr = next(item for item in snapshot["apps"] if item["id"] == "overseerr")
+        self.assertTrue(overseerr["reachable"])
+        self.assertFalse(overseerr["credentials"])
+        self.assertEqual(overseerr["action"], "complete_sign_in")
+        self.assertIn("Complete Plex sign-in", overseerr["detail"])
+        self.assertEqual(overseerr["link"], "http://umbrel.local:30990")
+        self.assertFalse(any(
+            call[0] == "json" and call[2].endswith("/api/v1/settings/main")
+            for call in client.calls
+        ))
+        self.assertTrue(all(
+            call[1] == "GET" for call in client.calls if call[0] == "request"
+        ))
+
     def test_confirmation_detects_storage_when_no_choice_is_submitted(self):
         self.reconciler.detect_apps()
         self.reconciler.reconcile_async = lambda: True
