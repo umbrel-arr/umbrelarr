@@ -2169,7 +2169,11 @@ class Reconciler:
             })
         else:
             values.update({
-                "settings-proxy-type": "",
+                # Bazarr deliberately preserves an empty string for this field,
+                # while its proxy validator only accepts a real null value or a
+                # supported proxy scheme. Its settings form converts the
+                # sentinel string "None" to null before validation.
+                "settings-proxy-type": "None",
                 "settings-proxy-url": "",
                 "settings-proxy-port": "",
                 "settings-proxy-exclude": [],

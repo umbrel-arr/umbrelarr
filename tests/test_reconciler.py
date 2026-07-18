@@ -2324,6 +2324,21 @@ class ReconcilerTests(unittest.TestCase):
         self.assertEqual(client.preferences["proxy_ip"], "")
         self.assertFalse(client.preferences["proxy_bittorrent"])
 
+    def test_direct_provider_clears_bazarr_proxy_with_null_sentinel(self):
+        detail = self.reconciler.configure_bazarr(False)
+
+        call = next(
+            call for call in self.client.calls
+            if call[0] == "form" and call[2].endswith("/api/system/settings")
+        )
+        values = call[4]
+        self.assertEqual(values["settings-proxy-type"], "None")
+        self.assertEqual(values["settings-proxy-url"], "")
+        self.assertEqual(values["settings-proxy-port"], "")
+        self.assertEqual(values["settings-proxy-exclude"], [])
+        self.assertEqual(call[3], {"X-API-KEY": "bazarr-key"})
+        self.assertEqual(detail, "HD Sonarr and Radarr are connected")
+
     def test_sabnzbd_uses_current_socks_setting(self):
         original_form = self.client.form
 
