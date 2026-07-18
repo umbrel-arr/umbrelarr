@@ -609,6 +609,7 @@ test('connects a first service without exposing unselected catalog defaults', as
     modules: fresh.modules.map(module => ({
       ...module,
       enabled: module.id === 'prowlarr' || module.id === 'sonarr',
+      ...(module.id === 'sonarr' ? { credentialConfigured: true, credentialSource: 'managed_config' } : {}),
     })),
     apps: [
       { id: 'prowlarr', name: 'Prowlarr', reachable: true, credentials: true, action: 'none', detail: 'Connection verified', link: '#' },
@@ -698,6 +699,10 @@ test('blocks apply and explains rejected service credentials', async ({ page }) 
   await expect(page.locator('#selectedServiceSummary')).toContainText('Sonarr');
   await expect(page.locator('#setupApps')).toContainText('Credentials rejected');
   await expect(page.locator('#setupApps')).toContainText('Stored API credentials were rejected');
+  await expect(page.locator('[data-connection-card="sonarr"] .credential-automatic')).toHaveCount(0);
+  await expect(page.locator('[data-connection-card="sonarr"] fieldset')).toBeVisible();
+  await expect(page.locator('[data-connection-card="sonarr"] [data-connection-source="sonarr"][value="ui"]')).toBeChecked();
+  await expect(page.locator('[data-connection-card="sonarr"] [data-connection-key]')).toBeEnabled();
   await expect(page.locator('#confirmSetup')).toBeHidden();
   await expect(page.locator('#setupActionHelp')).toContainText('Update the connection above, then check again.');
   await expectNoDocumentOverflow(page);

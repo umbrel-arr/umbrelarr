@@ -890,7 +890,8 @@ function renderDirectConnections(module,blockers){
   const usesCredentials=modules.some(item=>item.requires_api_key);setText('directConnectionsHelp',usesCredentials?'Enter an API address this process can reach. Automatically discovered credentials are validated without exposing them.':'Enter a service address this process can reach.');const credentialNote=element('directConnectionNote');if(credentialNote)credentialNote.hidden=!usesCredentials;
   target.innerHTML=modules.map(item=>{
     const draft=connectionDrafts[item.id]||{};const address=draft.url??item.connectionUrl??'';const keyValue=draft.apiKey||'';
-    const source=item.requires_api_key?initialCredentialSource(item,draft):'';if(!item.requires_api_key){delete draft.apiKey;delete draft.credentialSource;}else if(source==='automatic')delete draft.credentialSource;else draft.credentialSource=source;connectionDrafts[item.id]=draft;
+    const app=(setupState.apps||[]).find(value=>value.id===item.id);const rejectedAutomatic=automaticCredentialSource(item)&&app?.action==='invalid_credentials';
+    const source=item.requires_api_key?(rejectedAutomatic?'ui':initialCredentialSource(item,draft)):'';if(!item.requires_api_key){delete draft.apiKey;delete draft.credentialSource;}else if(source==='automatic')delete draft.credentialSource;else draft.credentialSource=source;connectionDrafts[item.id]=draft;
     const environmentVariable=apiKeyEnvironmentVariable(item);
     const environmentActive=item.credentialSource==='environment'&&item.credentialConfigured;
     const uiActive=item.credentialSource==='ui'&&item.credentialConfigured;
